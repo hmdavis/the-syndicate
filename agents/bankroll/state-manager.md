@@ -256,6 +256,10 @@ def settle_bet(
         _refresh_agent_performance(cur, bet["agent_used"], bet["sport"])
         conn.commit()
 
+    # ── Update signal_performance ──
+    _refresh_signal_performance(cur, bet["sport"])
+    conn.commit()
+
     # ── Snapshot today ──
     _take_daily_snapshot(cur)
     conn.commit()
