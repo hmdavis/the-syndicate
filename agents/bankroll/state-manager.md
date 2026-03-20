@@ -58,6 +58,58 @@ def get_conn() -> sqlite3.Connection:
     return conn
 ```
 
+### 1.5. Signal Validation
+
+```python
+import json
+
+REQUIRED_SIGNAL_FIELDS = {
+    "model_edge_pct":      (int, float),
+    "fair_value":          (str,),
+    "model_conflict":      (bool, int),
+    "conflict_pts":        (int, float),
+    "best_available_line": (str,),
+    "books_pricing":       (int,),
+    "kelly_fraction":      (int, float),
+    "thin_market":         (bool, int),
+}
+
+def _validate_signals(signals: dict) -> bool:
+    """
+    Validate that a signals dict conforms to the contract.
+    Returns True if valid, False otherwise. Logs specific failures.
+    """
+    if not isinstance(signals, dict):
+        logger.warning(f"Signals must be a dict, got {type(signals).__name__}")
+        return False
+
+    for field, types in REQUIRED_SIGNAL_FIELDS.items():
+        if field not in signals:
+            logger.warning(f"Signals missing required field: {field}")
+            return False
+        if not isinstance(signals[field], types):
+            logger.warning(
+                f"Signal '{field}' has wrong type: expected {types}, "
+                f"got {type(signals[field]).__name__}"
+            )
+            return False
+
+    if signals["model_edge_pct"] <= 0:
+        logger.warning(f"model_edge_pct must be > 0, got {signals['model_edge_pct']}")
+        return False
+    if signals["conflict_pts"] < 0:
+        logger.warning(f"conflict_pts must be >= 0, got {signals['conflict_pts']}")
+        return False
+    if signals["books_pricing"] < 1:
+        logger.warning(f"books_pricing must be >= 1, got {signals['books_pricing']}")
+        return False
+    if not (0.0 <= signals["kelly_fraction"] <= 1.0):
+        logger.warning(f"kelly_fraction must be 0.0-1.0, got {signals['kelly_fraction']}")
+        return False
+
+    return True
+```
+
 ### 2. Record a New Bet
 
 ```python
@@ -73,6 +125,7 @@ def record_bet(
     agent_used: str = None,
     confidence: float = None,
     notes: str = None,
+    signals: dict = None,
 ) -> int:
     """
     Insert a new bet as PENDING. Returns the new bet ID.
@@ -85,8 +138,10 @@ def record_bet(
         odds:        American odds integer, e.g. -110, +145, -350
         stake:       Dollar amount wagered
         agent_used:  Which Syndicate agent recommended this bet
-        confidence:  Agent confidence score 0.0–1.0 (optional)
+        confidence:  Agent confidence score 0.0-1.0 (optional)
         notes:       Free-text notes
+        signals:     Structured decision-point signals dict (pipeline bets only).
+                     Validated against REQUIRED_SIGNAL_FIELDS. Set to NULL on failure.
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -98,14 +153,22 @@ def record_bet(
     if row and not row["enabled"]:
         logger.warning(f"Sport {sport} is disabled in sports_config.")
 
+    # Validate signals if provided — set to None on failure
+    validated_signals = None
+    if signals is not None:
+        if _validate_signals(signals):
+            validated_signals = json.dumps(signals)
+        else:
+            logger.warning("Signals validation failed — recording bet without signals.")
+
     cur.execute("""
         INSERT INTO bets
             (sport, game, market, selection, odds, stake, result,
-             agent_used, confidence, notes, placed_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
+             agent_used, confidence, notes, signals, placed_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, json(?), ?)
     """, (
         sport.upper(), game, market, selection, odds, round(stake, 2),
-        agent_used, confidence, notes,
+        agent_used, confidence, notes, validated_signals,
         datetime.now(timezone.utc).isoformat()
     ))
     bet_id = cur.lastrowid
