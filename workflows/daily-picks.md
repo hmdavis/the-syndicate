@@ -114,6 +114,13 @@ This step closes the learning feedback loop. The orchestrator queries `~/.syndic
       AND result IN ('WIN','LOSS','PUSH')
     GROUP BY market;
 
+    -- 4. Signal-level performance (from signal_performance cache)
+    SELECT signal_name, signal_bucket, total_bets, win_rate, roi_pct, avg_clv
+    FROM signal_performance
+    WHERE sport LIKE '%{sport_pattern}%'
+      AND total_bets >= 10
+    ORDER BY signal_name, roi_pct DESC;
+
 **Output:** `{performance_context}` — structured as follows:
 
 ```
@@ -141,6 +148,27 @@ CALIBRATION SIGNALS:
 UNDERPERFORMER FLAGS:
   [Any agent+sport with negative ROI over 20+ bets]
   - [agent]: -X.X% ROI over N bets — increase skepticism, require stronger edge to act
+
+SIGNAL INSIGHTS (min 10 bets per bucket):
+  MODEL CONFLICT:
+    conflict=false: [N] bets | [X.X%] ROI | [+/-X.X]c CLV -> [STATUS]
+    conflict=true:  [N] bets | [X.X%] ROI | [+/-X.X]c CLV -> [STATUS]
+  EDGE SIZE:
+    <3%:  [N] bets | [X.X%] ROI -> [STATUS]
+    3-4%: [N] bets | [X.X%] ROI -> [STATUS]
+    4-5%: [N] bets | [X.X%] ROI -> [STATUS]
+    5%+:  [N] bets | [X.X%] ROI -> [STATUS]
+  MARKET LIQUIDITY:
+    7+ books:  [N] bets | [X.X%] ROI -> [STATUS]
+    4-6 books: [N] bets | [X.X%] ROI -> [STATUS]
+    1-3 books: [N] bets | [X.X%] ROI -> [STATUS]
+
+AUTOMATED ADJUSTMENTS ACTIVE:
+  [List each active adjustment, e.g.:]
+  -> model_conflict=true: require 5%+ edge (raised from 3%)
+  -> books_pricing 1-3: sizing reduced 50% (validated by signal history)
+
+(Buckets with < 10 bets are shown with "(insufficient data)" and do not trigger adjustments.)
 
 (If < 10 settled bets exist for this sport, output: "INSUFFICIENT HISTORY — no calibration available, using default parameters.")
 ```
