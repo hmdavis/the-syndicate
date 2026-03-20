@@ -313,6 +313,70 @@ def _refresh_agent_performance(cur: sqlite3.Cursor, agent_name: str, sport: str)
           row["last_used"]))
 ```
 
+### 4.5. Refresh Signal Performance Cache
+
+```python
+from collections import defaultdict
+
+BUCKET_RULES = {
+    'model_edge_pct':  lambda v: '5%+' if v >= 5 else '4-5%' if v >= 4 else '3-4%' if v >= 3 else '<3%',
+    'conflict_pts':    lambda v: '2+' if v >= 2 else '0-2' if v > 0 else '0',
+    'books_pricing':   lambda v: '7+' if v >= 7 else '4-6' if v >= 4 else '1-3',
+    'kelly_fraction':  lambda v: '15%+' if v >= 0.15 else '5-15%' if v >= 0.05 else '<5%',
+    'model_conflict':  lambda v: str(bool(v)).lower(),
+    'thin_market':     lambda v: str(bool(v)).lower(),
+    'human_override':  lambda v: str(bool(v)).lower(),
+}
+
+def _refresh_signal_performance(cur: sqlite3.Cursor, sport: str):
+    """
+    Recompute signal-level stats for a sport after settlement.
+    Reads from bet_signals_v, bucketizes each signal, and upserts
+    into signal_performance.
+
+    Requires conn.row_factory = sqlite3.Row (set by get_conn()).
+    """
+    rows = cur.execute("""
+        SELECT * FROM bet_signals_v
+        WHERE sport = ? AND result IN ('WIN','LOSS','PUSH')
+    """, (sport,)).fetchall()
+
+    if not rows:
+        return
+
+    for signal_name, bucket_fn in BUCKET_RULES.items():
+        buckets = defaultdict(list)
+        for row in rows:
+            val = row[signal_name]
+            if val is not None:
+                buckets[bucket_fn(val)].append(row)
+
+        for bucket, bets in buckets.items():
+            wins = sum(1 for b in bets if b['result'] == 'WIN')
+            total_pnl = sum(b['pnl'] for b in bets)
+            total_wagered = sum(b['stake'] for b in bets)
+            clv_vals = [b['clv'] for b in bets if b['clv'] is not None]
+            avg_clv = round(sum(clv_vals) / len(clv_vals), 2) if clv_vals else None
+
+            cur.execute("""
+                INSERT INTO signal_performance
+                    (signal_name, signal_bucket, sport, total_bets, win_rate,
+                     roi_pct, avg_clv, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now','utc'))
+                ON CONFLICT(signal_name, signal_bucket, sport) DO UPDATE SET
+                    total_bets   = excluded.total_bets,
+                    win_rate     = excluded.win_rate,
+                    roi_pct      = excluded.roi_pct,
+                    avg_clv      = excluded.avg_clv,
+                    last_updated = excluded.last_updated
+            """, (
+                signal_name, bucket, sport, len(bets),
+                round(wins / len(bets), 4),
+                round((total_pnl / total_wagered) * 100, 2) if total_wagered else 0,
+                avg_clv
+            ))
+```
+
 ### 5. Daily Snapshot
 
 ```python
