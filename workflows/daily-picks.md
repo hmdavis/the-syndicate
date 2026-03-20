@@ -1,278 +1,324 @@
 # Daily Picks Workflow
 
-Full pipeline: research → model → line comparison → sizing → pick report. Run once per day, 3–4 hours before the first game of the slate.
-
----
+> **Hybrid pipeline:** Claude Code auto-chains agents and surfaces checkpoints
+> between steps. Say "yes" to proceed, or intervene with the listed commands.
 
 ## How to Run
 
-This is a **Claude Code workflow**. You run it by starting Claude Code and prompting it with the Sharp Orchestrator agent.
+Activate the **Sharp Orchestrator** agent in Claude Code and prompt:
 
-### Claude Code (recommended)
+    Run the daily picks workflow for [SPORT] on [DATE].
 
-Open Claude Code in the `the-syndicate` repo and select the **Sharp Orchestrator** agent, then prompt:
+The orchestrator reads this workflow and executes each step.
 
-```
-Run the daily picks workflow for NFL, Sunday November 24 2024.
-```
+## Inputs
 
-Claude Code will execute each pipeline step — invoking the relevant agents, writing intermediate outputs, and producing the final pick report. You can also run individual steps:
-
-```
-Run Step 3 of the daily picks workflow for Bills at Chiefs.
-```
-
-### Claude Desktop
-
-Not directly supported. Claude Desktop does not have filesystem access or the ability to execute code. Use these workflow docs as reference to structure your own prompts — copy the output templates and ask Claude to fill them in with data you provide.
-
-### CLI (standalone)
-
-The workflow references Python code blocks throughout. To run steps independently outside Claude Code:
-
-```bash
-# Install dependencies
-pip install nba_api nfl-data-py pybaseball requests pandas
-
-# Set your Odds API key
-export ODDS_API_KEY=your_key_here
-
-# Individual steps use code blocks from this doc and the agent files.
-# There is no single `run_daily_picks.py` script — the orchestration
-# happens through Claude Code agent chaining.
-```
-
-To record picks after the workflow completes:
-```bash
-./scripts/bet.sh place
-```
-
----
-
-## Sport Context
-
-**Set your sport before running.** This workflow operates within a single sport per session. Do not mix sports in one pipeline run — each sport has distinct data sources, key numbers, and model parameters.
-
-```
-SPORT: [NFL | NBA | MLB | NHL | NCAAF | NCAAB]
-SLATE_DATE: [YYYY-MM-DD]
-BANKROLL_DB: ~/.syndicate/bankroll.db
-```
-
----
+- `{sport}` — The Odds API sport key (e.g., `basketball_ncaab`, `americanfootball_nfl`)
+- `{date}` — Slate date (YYYY-MM-DD)
 
 ## Agents Involved
 
-| Agent | Role | Output |
-|-------|------|--------|
-| `pregame-researcher` | Injuries, line movement, situational data per game | Research brief per game |
-| `market-maker` | Independent fair-value spread, total, and moneyline | `fair_values.json` |
-| `elo-modeler` | Elo-based win probability, margin estimate | `elo_estimates.json` |
-| `line-shopper` | Best available price across 10+ books | `best_lines.json` |
-| `kelly-criterion` | Fractional Kelly stake sizing from bankroll | `picks.json` |
+| Step | Agent | Role |
+|------|-------|------|
+| 1 | State Manager | Bankroll gate check |
+| 1.5 | (orchestrator) | Game list lookup |
+| 2 | Odds Scraper | Pull live lines |
+| 3 | Pregame Researcher | Per-game research briefs |
+| 4a | Market Maker | Independent fair values |
+| 4b | Elo Modeler | Elo-based validation |
+| 5 | Line Shopper | Best number across books |
+| 6 | Kelly Criterion Manager | Fractional Kelly sizing |
+| 7 | (orchestrator) | Betslip synthesis |
+| 8 | State Manager | Record bets (optional) |
 
 ---
 
-## Pipeline Steps
+## Step 1 — State Manager (gate)
 
-### Step 1 — Load Bankroll State
+**Agent:** State Manager
+**Depends on:** none
+**Dispatch mode:** foreground
 
-Read current bankroll from `~/.syndicate/bankroll.db` before sizing anything. All unit calculations are anchored to this state.
+**Purpose:** Verify bankroll is healthy before running the pipeline.
 
-```bash
-sqlite3 ~/.syndicate/bankroll.db \
-  "SELECT current_bankroll, peak_bankroll, unit_size, drawdown_pct FROM bankroll_state LIMIT 1;"
-```
+**Dispatch prompt:**
+> Activate State Manager. Read the current bankroll state from
+> ~/.syndicate/bankroll.db. The bankroll_state table has columns:
+> current_balance, starting_balance, risk_tolerance, created_at,
+> updated_at. Compute P&L as (current_balance - starting_balance).
+> Compute drawdown percentage as ((starting_balance -
+> current_balance) / starting_balance * 100) — if current_balance >
+> starting_balance, drawdown is 0%. Check sports_config to confirm
+> {sport} is enabled. Report: current balance, starting balance,
+> computed P&L, computed drawdown %, risk tolerance, and sport
+> status. If drawdown exceeds 20%, output HALT with the reason. No
+> new picks until drawdown recovers to < 15%. Otherwise output CLEAR
+> with the bankroll summary.
 
-**Gate check:** If `drawdown_pct >= 20`, do not run the pipeline. Output:
-```
-PIPELINE PAUSED: 20%+ drawdown protection active.
-Current: $X,XXX | Peak: $X,XXX | Drawdown: XX.X%
-No new picks until drawdown recovers to < 15%.
-```
+**Expected output:** Bankroll balance, computed P&L, computed drawdown %, CLEAR/HALT status, sport config.
 
----
+**Checkpoint:**
 
-### Step 2 — Load Today's Slate
-
-Fetch the game schedule for the sport and date. Filter to games starting within 24 hours.
-
-```python
-# For NFL — nfl_data_py
-import nfl_data_py as nfl
-schedule = nfl.import_schedules([2024])
-todays_games = schedule[schedule["gameday"] == SLATE_DATE]
-
-# For NBA — nba_api
-from nba_api.stats.endpoints import ScoreboardV2
-scoreboard = ScoreboardV2(game_date=SLATE_DATE)
-```
+    Bankroll: $X | P&L: $X | Drawdown: X% | Status: CLEAR/HALT | Sport: {sport} enabled
+    Proceed? (yes / halt)
 
 ---
 
-### Step 3 — Run Pregame Researcher (per game)
+## Step 1.5 — Game List Lookup (no agent dispatch)
 
-Invoke **pregame-researcher** on each game. Each brief must complete before model inputs are assembled. Briefs run in parallel — one per game, not sequentially.
+**Depends on:** Step 1 CLEAR
 
-**Inputs per game:**
-- Home/away team
-- Kickoff/tip time
-- Sport key
+**Purpose:** Fetch the day's game list so Steps 2 and 3 can run in parallel.
 
-**Outputs per game:**
-- Injury report (both sides)
-- Line movement summary (open → current, +movement)
-- Public betting percentages (bets %, money %)
-- Sharp signals (steam, RLM flags)
-- Weather block (NFL/MLB outdoor only)
-- Rest/schedule spot analysis
-- Situational angles (divisional, primetime, revenge, look-ahead)
+The orchestrator queries The Odds API directly for {sport} on {date} to get matchups and commence times. Only the game list is needed — full odds come in Step 2.
 
-Store briefs as `research/[away]_at_[home].md`.
+**Action:**
 
----
+    curl -s "https://api.the-odds-api.com/v4/sports/{sport}/odds?apiKey=$ODDS_API_KEY&regions=us&dateFormat=iso" \
+      | python3 -c "import sys,json; games=json.load(sys.stdin); [print(f\"{g['away_team']} vs {g['home_team']} | {g['commence_time']}\") for g in games]"
 
-### Step 4 — Run Market Maker + Elo Modeler (per game)
+**Output:** `{game_list}` — list of matchups with tip times.
 
-Invoke **market-maker** and **elo-modeler** independently. Each produces a fair-value number from different methodologies. Cross-reference outputs — agreement increases confidence.
+**Checkpoint:**
 
-**market-maker inputs:** Power ratings, home field, rest differential, pace/tempo, injury-adjusted efficiency
-**elo-modeler inputs:** Current Elo ratings, home field factor, rest multiplier
-
-Both agents output to `models/[game_id]_fair_value.json`:
-
-```json
-{
-  "game_id": "nfl_2024_wk12_buf_at_kc",
-  "sport": "NFL",
-  "home_team": "KC",
-  "away_team": "BUF",
-  "market_maker": {
-    "fair_spread": -6.5,
-    "fair_total": 48.5,
-    "home_win_prob": 0.648,
-    "away_win_prob": 0.352
-  },
-  "elo_model": {
-    "fair_spread": -7.0,
-    "home_win_prob": 0.661
-  },
-  "consensus_spread": -6.75,
-  "consensus_win_prob": 0.655
-}
-```
+    Found N games for {sport} on {date}:
+    - Away vs Home | tip time
+    Proceed? (yes / drop [game])
 
 ---
 
-### Step 5 — Line Shopping
+## Step 2 — Odds Scraper (parallel with Step 3)
 
-Invoke **line-shopper** to pull current best prices across all available books. Compare each model fair value against the best available market line.
+**Agent:** Odds Scraper
+**Depends on:** Step 1 CLEAR + game list from Step 1.5
+**Dispatch mode:** background (parallel with Step 3)
 
-```python
-# line-shopper pulls from The Odds API
-# markets: spreads, h2h (moneyline), totals
-# regions: us
-# Compare model number vs. best available price
-```
+**Purpose:** Pull structured odds from every available book.
 
-**Edge calculation:**
-```
-spread_edge = model_fair_spread - best_market_spread
-prob_edge   = model_win_prob - market_implied_prob (no-vig)
-```
+**Dispatch prompt:**
+> Activate Odds Scraper. Pull current odds for these {sport} games on
+> {date}: {game_list}. Use the `ODDS_API_KEY` environment variable
+> (as defined in CLAUDE.md and .env.example). Markets: h2h, spreads,
+> totals. Region: us. Return a structured table per game showing:
+> matchup, spread (home perspective), total, and moneyline for each
+> available book. Include the odds timestamp for each game. Flag any
+> games with fewer than 3 books pricing them as "thin market" — this
+> flag will propagate to downstream sizing.
 
-**Bet threshold:** Edge ≥ 3% on probability OR ≥ 1.5 points on spread to qualify for sizing.
+**Expected output:** Structured odds data per game per book with timestamps. Thin market flags. API quota remaining.
 
----
+**Checkpoint:**
 
-### Step 6 — Kelly Sizing
-
-Pass all qualifying edges to **kelly-criterion** for fractional Kelly sizing against current bankroll.
-
-```bash
-python agents/bankroll/kelly_criterion.py size \
-  --edges models/today_edges.json \
-  --output picks/today_picks.json \
-  --bankroll ~/.syndicate/bankroll.db
-```
-
-Kelly config defaults:
-- Kelly fraction: 0.25 (quarter Kelly)
-- Min edge: 3%
-- Max single bet: 3 units
-- Max portfolio exposure: 10 units
+    Pulled odds for N games across N books | Thin markets: N | API calls remaining: N
+    Games: [list]
+    Proceed? (yes / drop [game] / add context)
 
 ---
 
-### Step 7 — Generate Pick Report
+## Step 3 — Pregame Researcher (parallel with Step 2)
 
-Compile all outputs into a structured pick report. Format defined below.
+**Agent:** Pregame Researcher
+**Depends on:** Step 1 CLEAR + game list from Step 1.5
+**Dispatch mode:** background (one subagent per game, all parallel)
 
----
+**Purpose:** Produce a structured research brief per game covering injuries, situational angles, and trends.
 
-## Pick Report Output Template
+**Dispatch prompt (per game):**
+> Activate Pregame Researcher. Run your full pregame checklist for
+> {away_team} vs {home_team} on {date}. Sport: {sport}. Cover:
+> injury report, situational angles (rest/travel/schedule spot), key
+> trends (ATS, O/U recent), and public betting lean if available. Do
+> NOT generate a bet recommendation — that comes downstream. Output a
+> structured research brief.
 
-```
-================================================================================
-THE SYNDICATE — DAILY PICKS
-================================================================================
-Sport:          [NFL / NBA / MLB / NHL]
-Slate Date:     [YYYY-MM-DD]
-Games on Card:  [N]
-Generated:      [YYYY-MM-DD HH:MM ET]
+**Expected output:** Per-game research brief with injury flags, situational angles, and key trends.
 
-BANKROLL STATUS
-  Current:      $[X,XXX.XX]
-  Peak:         $[X,XXX.XX]
-  Drawdown:     [X.X%]
-  Unit Size:    $[XX.XX]  (1% of starting bankroll)
-  Open Units:   [X.X]u
+**Checkpoint:**
 
-================================================================================
-PICKS ([N] plays, [X.X] total units)
-================================================================================
-
-PICK #1
-  Game:         [Away] @ [Home]  |  [Day, Date, Time ET]
-  Bet:          [Team] [Spread/ML/Total] @ [Book]
-  Market Line:  [Odds]
-  Fair Value:   [Model spread/prob]  (Market Maker: [X.X] | Elo: [X.X])
-  Edge:         [+X.X%] probability / [+X.X pts] on spread
-  CLV Target:   Beat closing line by [X] points / [X]%
-  Kelly:        Full [X.Xu] → Quarter Kelly [X.Xu]
-  Stake:        [X.X] units / $[XX.XX]
-  Confidence:   [A / B / C]
-
-  Key Signals:
-    - [Injury/situational/weather/sharp signal — 1 line each]
-    - [...]
-
-  Rationale:
-    [2-3 sentences: primary edge, supporting factors, key risk]
-
---------------------------------------------------------------------------------
-
-[PICK #2, #3, #4 — same format]
-
-================================================================================
-PASSES ([N] games reviewed, no edge)
-================================================================================
-  [Away] @ [Home]  — [1-line reason: e.g. "edge 1.8%, below 3% floor"]
-  [...]
-
-================================================================================
-PIPELINE NOTES
-================================================================================
-  [Any data quality issues, late scratches to monitor, line move alerts]
-================================================================================
-```
+    Research complete for N games | Key flags:
+    - [game]: [top flag]
+    Proceed? (yes / deep dive [game] / skip [game])
 
 ---
 
-## Constraints
+## Step 4 — Market Maker + Elo Modeler (parallel, then cross-reference)
 
-- Never issue picks without completing Steps 1–5. Partial pipelines produce noise.
-- CLV target is mandatory — it is the only post-game accountability metric that matters.
-- Re-run **pregame-researcher** for any game with a key player listed questionable within 2 hours of kickoff.
-- If market-maker and elo-modeler disagree by more than 2 points, flag as "model conflict" and downgrade confidence one tier.
-- Log all picks to `~/.syndicate/bet_log.db` immediately on report generation — before placement.
+**Agents:** Market Maker, Elo Modeler
+**Depends on:** Steps 2 + 3
+**Dispatch mode:** foreground (both dispatched in parallel, orchestrator cross-references)
+
+**Purpose:** Build independent fair-value lines from two methodologies and flag disagreements.
+
+**Dispatch prompt (Market Maker):**
+> Activate Market Maker. Build independent fair-value lines for these
+> games. Here is the pregame research for situational adjustments:
+> {pregame_output}. For each game, output: fair-value spread,
+> fair-value total, no-vig moneylines, implied win probabilities. Do
+> NOT look at the market lines until after you've formed your own
+> number from power ratings and situational factors. Then compare your
+> fair values against the market odds: {odds_output}. Output edge
+> percentage vs the market consensus line for each game.
+
+**Dispatch prompt (Elo Modeler):**
+> Activate Elo Modeler. Generate Elo-based power ratings and game
+> predictions for these matchups: {game_list}. Sport: {sport}. Output:
+> Elo rating for each team, predicted spread, and implied win
+> probability per game.
+
+**Cross-reference (orchestrator):**
+After both agents return, compare their spreads. If they disagree by more than 2 points on any game, flag as "model conflict" and downgrade confidence one tier. Use Market Maker's fair values as primary, Elo as validation.
+
+**Expected output:** Per-game fair-value spread, total, MLs, win probs, edge %, model agreement status.
+
+**Checkpoint:**
+
+    Fair values built | Edges found:
+    - [game]: market [X] -> fair value [Y] ([Z]% edge) | Elo agrees/conflicts
+    - [game]: [Z]% -- PASS
+    Proceed with N actionable games? (yes / force [game] / drop [game])
+
+---
+
+## Step 5 — Line Shopper
+
+**Agent:** Line Shopper
+**Depends on:** Steps 2 + 4
+**Dispatch mode:** foreground
+
+**Purpose:** Find the best available number and juice for each actionable game.
+
+**Dispatch prompt:**
+> Activate Line Shopper. For each game where Market Maker found an
+> edge of 3% or greater, compare the available book lines from the
+> odds data: {odds_output}. Identify the best available number and
+> best juice for the recommended side. Output: game, recommended side,
+> best book, best line, best juice, and the juice savings vs market
+> average.
+
+**Expected output:** Best book + line + juice per actionable game.
+
+**Checkpoint:**
+
+    Best lines found:
+    - [game]: [side] best at [book] ([juice]) -- saves N cents vs avg
+    Proceed to sizing? (yes / recheck [game])
+
+---
+
+## Step 6 — Kelly Criterion Manager
+
+**Agent:** Kelly Criterion Manager
+**Depends on:** Steps 1 + 4 + 5
+**Dispatch mode:** foreground
+
+**Purpose:** Size bets using fractional Kelly, enforcing caps and drawdown rules.
+
+**Dispatch prompt:**
+> Activate Kelly Criterion Manager. Size bets using fractional Kelly
+> (1/4). Bankroll: {bankroll_balance}. For each pick, here are the
+> inputs — let Kelly compute the edge internally from these: win
+> probability is {win_prob} (from Market Maker), best available
+> American odds are {best_odds_american} (from Line Shopper). Apply
+> drawdown protection rules. Enforce 3-unit max per bet and 10-unit
+> portfolio cap. Output: game, side, computed edge %, Kelly fraction,
+> units, dollar amount, and total portfolio exposure.
+
+**Expected output:** Sized picks with units, dollars, and total exposure.
+
+**Checkpoint:**
+
+    Sizing complete | Total exposure: Nu ($X / X% of bankroll)
+    - [game]: [side] Nu ($X)
+    Generate final betslip? (yes / adjust [game] units)
+
+---
+
+## Step 7 — Betslip Synthesis (no agent dispatch)
+
+**Depends on:** All previous steps
+
+**Purpose:** Assemble the final betslip from all upstream outputs.
+
+**Stale odds check:** Before assembling, compare odds timestamps from Step 2 against game commence times. If any odds are > 90 minutes stale relative to game time, flag as "STALE" and exclude.
+
+**Action:** Combine outputs from all steps into a final betslip. For each pick:
+- Matchup, recommended side, best book + line
+- Fair value, edge %, model agreement (Market Maker vs Elo)
+- Units, dollar stake
+- 2-3 sentence thesis drawing from pregame research (Step 3)
+
+For passed games, show why (edge < 3%, thin market, model conflict, stale odds).
+
+End with:
+- Exposure summary (total units, total dollars, % of bankroll)
+- Responsible gambling disclaimer
+
+---
+
+## Step 8 — Record Bets (optional)
+
+**Agent:** State Manager
+**Depends on:** Step 7 (user approval)
+**Dispatch mode:** foreground
+
+**Purpose:** Persist picks to the bankroll database for tracking and the learning feedback loop.
+
+Ask the user: **Record these picks to your bankroll? (yes / no)**
+
+If yes:
+
+**Dispatch prompt:**
+> Activate State Manager. Record the following bets to
+> ~/.syndicate/bankroll.db. For each bet, insert into the bets table
+> with: sport = {sport}, game = {matchup}, market = {market_type}
+> (e.g., "spread", "moneyline", "total"), selection = {selection}
+> (e.g., "Penn +25.5", "BYU ML"), odds = {best_odds_american},
+> stake = {dollar_amount}, agent_used = "Sharp Orchestrator
+> (pipeline: Odds Scraper -> Pregame Researcher -> Market Maker ->
+> Elo Modeler -> Line Shopper -> Kelly Criterion)", result =
+> 'PENDING'. Do not modify bankroll_state until bets settle.
+
+**Checkpoint:**
+
+    Recorded N bets | Bet IDs: [list]
+    Run ./scripts/bankroll-status.sh to verify.
+
+---
+
+## Intervention Commands
+
+Available at any checkpoint:
+
+| Command | Effect |
+|---------|--------|
+| `yes` / Enter | Proceed to next step |
+| `halt` | Stop the pipeline |
+| `drop [game]` | Exclude game from remaining steps |
+| `force [game]` | Include a game that was auto-passed |
+| `deep dive [game]` | Re-run Pregame Researcher with more depth |
+| `adjust [game] units` | Override Kelly sizing |
+| `add context` | Provide additional info before next step |
+
+---
+
+## Decision Rules
+
+- **No partial pipelines.** Steps 1-6 must complete before betslip generation.
+- **3% edge floor.** Games below this threshold are passed, not sized.
+- **90-minute stale gate.** Odds older than 90 min from game time are excluded.
+- **Thin market.** < 3 books pricing a game = sizing reduced 50%.
+- **Model conflict.** Market Maker and Elo disagree by > 2 pts = confidence downgraded one tier.
+- **10-unit portfolio cap.** Total exposure cannot exceed 10 units across all picks.
+- **3-unit single bet cap.** No individual pick exceeds 3 units.
+- **20% drawdown halt.** Pipeline stops. No new picks until drawdown recovers to < 15%.
+
+---
+
+## Constraints & Disclaimers
+
+This system is for **educational and research purposes only**. Output is based on mathematical models and historical data. It is not a guarantee of profit and should not be construed as financial or gambling advice.
+
+- Sports betting involves substantial risk of loss.
+- No model eliminates variance.
+- Bet only what you can afford to lose entirely.
+- **Problem gambling resources:** 1-800-522-4700 | ncpgambling.org
