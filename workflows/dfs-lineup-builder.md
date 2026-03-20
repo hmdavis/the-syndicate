@@ -1,71 +1,44 @@
 # DFS Lineup Builder Workflow
 
-Full DFS pipeline: slate selection → player projections → lineup optimization → correlation stacks → ownership leverage → CSV export. Supports DraftKings and FanDuel.
-
----
+> **Hybrid pipeline:** Claude Code auto-chains agents and surfaces checkpoints
+> between steps. Full DFS pipeline from slate to CSV export.
 
 ## How to Run
 
-### Claude Code (recommended)
+Activate the **Sharp Orchestrator** agent in Claude Code and prompt:
 
-Open Claude Code in the `the-syndicate` repo, select the **DFS Lineup Optimizer** or **Sharp Orchestrator** agent, then prompt:
-
-```
-Build 50 GPP lineups for DraftKings NFL main slate, November 24 2024.
-```
-
-Claude Code will run projections, optimize lineups with salary cap constraints and correlation stacks, apply ownership leverage, and export a CSV ready for bulk upload.
+    Build 50 GPP lineups for DraftKings NFL main slate, [DATE].
 
 For cash games:
-```
-Build 3 cash lineups for FanDuel NBA tonight.
-```
 
-### Claude Desktop
+    Build 3 cash lineups for FanDuel NBA tonight.
 
-Not supported for lineup optimization — requires PuLP/scipy for linear programming and filesystem access to export CSV. You can discuss strategy, stacking theory, and ownership leverage in Claude Desktop, but actual lineup generation requires Claude Code.
+The orchestrator reads this workflow and executes each step.
 
-### CLI (standalone)
+## Inputs
 
-The optimizer uses PuLP for integer linear programming. To run independently:
+- `{sport}` — Sport key (`NFL`, `NBA`, `MLB`, `NHL`)
+- `{platform}` — `DraftKings` or `FanDuel`
+- `{contest_type}` — `GPP` or `CASH`
+- `{slate_date}` — Slate date (YYYY-MM-DD)
+- `{slate_type}` — `main`, `afternoon`, `primetime`, or `showdown`
+- `{n_lineups}` — Number of lineups to build (GPP: 20-150, Cash: 1-5)
 
-```bash
-pip install pulp numpy pandas scipy
+## Agents Involved
 
-# You'll need player salaries + projections as input.
-# Export from DraftKings/FanDuel, or scrape via the API endpoints
-# documented in Step 1 below.
+| Step | Agent | Role |
+|------|-------|------|
+| 1 | (orchestrator) | Load slate — player pool, salaries, game info |
+| 2 | Injury Monitor | Confirm availability, remove OUT/DOUBTFUL |
+| 3 | DFS Projector | Monte Carlo projections (10,000+ sims) |
+| 4 | DFS Lineup Optimizer | ILP/heuristic construction under salary cap |
+| 5 | (orchestrator) | Apply correlation stacks |
+| 6 | (orchestrator) | Apply ownership leverage |
+| 7 | (orchestrator) | Export CSV for platform upload |
 
-# The optimization code is in agents/dfs/dfs-lineup-optimizer.md.
-# The projection Monte Carlo is in agents/dfs/dfs-projector.md.
-```
-
-The exported CSV uploads directly to DraftKings or FanDuel via their bulk lineup import.
-
----
-
-## Sport Context
-
-DFS is slate-specific. Set sport and contest type before running. GPP (tournament) and cash (50/50, double-up) require different optimization strategies.
-
-```
-SPORT:        [NFL | NBA | MLB | NHL]
-PLATFORM:     [DraftKings | FanDuel]
-CONTEST_TYPE: [GPP | CASH]
-SLATE_DATE:   [YYYY-MM-DD]
-SLATE_TYPE:   [main | afternoon | primetime | showdown]
-N_LINEUPS:    [1–150]  # GPP: 20–150, Cash: 1–5
-```
-
-Example:
-```
-SPORT:        NFL
-PLATFORM:     DraftKings
-CONTEST_TYPE: GPP
-SLATE_DATE:   2024-11-24
-SLATE_TYPE:   main
-N_LINEUPS:    50
-```
+Supporting agents invoked by DFS Projector in Step 3:
+- Meteorologist — weather adjustments for NFL outdoor (wind kills passing ceilings)
+- Stats Collector — recent performance, matchup grades, usage rates
 
 ---
 
@@ -118,194 +91,200 @@ N_LINEUPS:    50
 
 ---
 
-## Agents Involved
+## Step 1 — Load Slate (no agent dispatch)
 
-| Agent | Role | Output |
-|-------|------|--------|
-| `dfs-projector` | Monte Carlo fantasy point distributions per player | `projections.json` |
-| `dfs-lineup-optimizer` | ILP/heuristic lineup construction under salary cap | `lineups.csv` |
+**Depends on:** none
 
-Supporting data agents (invoked by dfs-projector):
-- `injury-monitor` — confirm player availability and snap/minutes projections
-- `meteorologist` — weather adjustments for NFL outdoor games (wind kills passing game value)
-- `stats-collector` — recent performance, matchup grades, target share, usage rates
+**Purpose:** Pull player pool, salaries, and game information from the platform.
 
----
+**Action:** Fetch the player pool for {platform} {sport} {slate_type} slate on {slate_date}. Data needed per player: name, team, position, salary, projected ownership %, game (opponent, time, O/U line), and injury status.
 
-## Pipeline Steps
+Sources:
+- DraftKings: `GET https://api.draftkings.com/lineups/v1/games/{contest_id}/draftables`
+- FanDuel: `GET https://api.fanduel.com/contests/{contest_id}/players`
+- Or export CSV from the platform's Lineup Tool
 
-### Step 1 — Load Slate
+**Checkpoint:**
 
-Pull player pool, salaries, and game information from platform.
-
-```python
-# DraftKings: export player pool CSV from DK Lineup Tool
-# FanDuel: export player pool CSV from FD Lineup Tool
-
-# Or use unofficial APIs:
-# DraftKings:
-GET https://api.draftkings.com/lineups/v1/games/{contest_id}/draftables
-
-# FanDuel:
-GET https://api.fanduel.com/contests/{contest_id}/players
-```
-
-**Minimum data fields per player:**
-- Name, team, position, salary, projected ownership %
-- Game (home/away opponent, game time, total O/U line)
-- Injury status
+    Slate loaded: {platform} {sport} {slate_type} | {slate_date}
+    Players: N | Games: N | Salary cap: $X
+    Proceed? (yes / switch slate / halt)
 
 ---
 
-### Step 2 — Run Injury Monitor
+## Step 2 — Injury Monitor
 
-Before projecting anyone, confirm availability via **injury-monitor**.
+**Agent:** Injury Monitor
+**Depends on:** Step 1
+**Dispatch mode:** foreground
 
-Remove from player pool:
-- OUT designations
-- DOUBTFUL (< 30% active rate historically in NFL)
+**Purpose:** Confirm player availability before projecting.
 
-Flag for manual review:
-- QUESTIONABLE within 6 hours of games — do not project until confirmed active
-- Limited practice participation (NFL Wed/Thu/Fri reps)
+**Dispatch prompt:**
+> Activate Injury Monitor. Check injury status for all players in
+> this {sport} slate: {slate_players}. Remove from player pool: all
+> OUT designations and DOUBTFUL (< 30% active rate historically in
+> NFL). Flag for manual review: QUESTIONABLE within 6 hours of lock
+> time, and players with limited practice participation. Do not
+> project any QUESTIONABLE player until confirmed active. Output:
+> removed players, flagged players, and the cleaned player pool.
 
----
+**Expected output:** Cleaned player pool with removals and flags.
 
-### Step 3 — Run DFS Projector
+**Checkpoint:**
 
-Invoke **dfs-projector** on the confirmed-available player pool. This is the core simulation step.
-
-**dfs-projector** runs 10,000+ Monte Carlo simulations per player using:
-- Base projection (mean fantasy points from recent form + matchup grade)
-- Distribution shape (positively skewed — upside is unlimited, floor is 0)
-- Positional correlations (QB + WR1 stack, SP + hitter stack in MLB)
-- Weather adjustments (NFL outdoor: wind ≥ 15 mph reduces QB/WR ceilings by 15–25%)
-- Snap/minutes/usage projections (confirmation from injury-monitor step)
-
-**Output per player (projections.json):**
-```json
-{
-  "player": "Patrick Mahomes",
-  "team": "KC",
-  "position": "QB",
-  "platform": "DraftKings",
-  "salary": 8400,
-  "projection_mean": 28.4,
-  "projection_median": 26.9,
-  "projection_floor_p10": 14.2,
-  "projection_ceiling_p90": 48.1,
-  "ownership_projected": 0.24,
-  "value_score": 3.38,
-  "ceiling_leverage": 0.71,
-  "stack_correlation": {
-    "Travis Kelce": 0.62,
-    "Rashee Rice": 0.58,
-    "Hollywood Brown": 0.41
-  }
-}
-```
-
-**Value score** = `projection_mean / (salary / 1000)`. Cash game minimum: 3.0x. GPP minimum: 2.5x (lower bar trades value for upside).
+    Removed: N players (OUT/DOUBTFUL)
+    Flagged: N players (QUESTIONABLE — awaiting confirmation)
+    Clean pool: N players remaining
+    Proceed? (yes / exclude [player] / include [player] / halt)
 
 ---
 
-### Step 4 — Run DFS Lineup Optimizer
+## Step 3 — DFS Projector
 
-Invoke **dfs-lineup-optimizer** to construct `N_LINEUPS` lineups meeting salary cap and position constraints.
+**Agent:** DFS Projector
+**Depends on:** Step 2 (cleaned player pool)
+**Dispatch mode:** foreground
 
-**dfs-lineup-optimizer** uses integer linear programming (ILP) for cash lineups and a Monte Carlo / simulation-based heuristic for GPP:
+**Purpose:** Run Monte Carlo simulations to build full projection distributions per player.
 
-```python
-# Cash optimization: maximize expected median score
-# Objective: max sum(projection_median_i * x_i)
-# Constraints:
-#   - Salary: sum(salary_i * x_i) <= cap
-#   - Position slots filled (roster config above)
-#   - Max players from single team: 8 (DK NFL), 8 (DK NBA)
-#   - Injuries excluded
+**Dispatch prompt:**
+> Activate DFS Projector. Run 10,000+ Monte Carlo simulations for
+> each player in this cleaned pool: {cleaned_pool}. Sport: {sport}.
+> Platform: {platform}. Use base projections from recent form +
+> matchup grades. Model positively skewed distributions (upside
+> unlimited, floor is 0). Include positional correlations (NFL:
+> QB+WR1 stack correlation 0.55-0.65; MLB: SP+hitter stack). Apply
+> weather adjustments for NFL outdoor if wind >= 15 mph (reduce
+> QB/WR ceilings 15-25%). Use snap/minutes/usage from injury
+> confirmations. Output per player: projection mean, median, floor
+> (P10), ceiling (P90), ownership projected, value score
+> (mean / salary per 1000), ceiling leverage score, and stack
+> correlations with teammates.
 
-# GPP optimization: maximize ceiling-weighted score with ownership leverage
-# Objective: max sum(projection_ceiling_weighted_i * leverage_factor_i * x_i)
-# leverage_factor = 1 / sqrt(projected_ownership)
-# Higher weight to low-ownership, high-upside players
-```
+**Expected output:** Projection distributions per player with value scores and correlation data.
 
----
+**Checkpoint:**
 
-### Step 5 — Correlation Stacks
-
-For GPP lineups, force correlation stacks from the same game. Correlated players win together when a game script breaks favorably.
-
-**NFL stack structures (DraftKings):**
-- Primary stack: QB + WR1 or WR2 from same team (correlation 0.55–0.65)
-- Bring-back: WR or RB from the opposing team (benefits from trailing/shooting game)
-- Mini-stack: TE from primary QB's team (correlation 0.45–0.60)
-
-**NBA stack structure (DraftKings):**
-- Game stack: 3–4 players from highest projected total (fastest-paced game on slate)
-- Avoid loading up one team — favor spreading across both teams in the featured game
-
-**MLB stack structure (DraftKings):**
-- 4-player minimum stack against the weakest starting pitcher on the slate
-- Batting order correlation: batters in positions 1–4 correlate more strongly than 5–9
-
-```python
-# dfs-lineup-optimizer stack enforcement:
-# For each lineup, require at least 1 QB+WR pair from the same team
-# Optionally lock a bring-back from the opponent (game theory diversity)
-# Rotate stacks across lineup set to maximize ownership differentiation
-```
+    Projections complete: N players | Sport: {sport}
+    Top value plays:
+    - [player] ([pos]) $[salary] | proj: [mean] | own: [pct]% | value: [X]x
+    Proceed? (yes / adjust [player] projection / exclude [player] / halt)
 
 ---
 
-### Step 6 — Ownership Leverage
+## Step 4 — DFS Lineup Optimizer
 
-Apply ownership-based leverage to differentiate GPP lineups. Differentiation is the difference between cashing a tournament and min-cashing.
+**Agent:** DFS Lineup Optimizer
+**Depends on:** Step 3 (projections)
+**Dispatch mode:** foreground
 
-```python
-# Leverage tiers:
-# CONTRARIAN: ownership < 5% — high leverage, significant differentiation
-# LOW-OWNED:  ownership 5–12% — good leverage
-# MEDIUM:     ownership 12–25% — standard
-# CHALK:      ownership 25%+ — negative leverage in large GPP fields
+**Purpose:** Construct optimal lineups under salary cap and position constraints.
 
-# For a 50-lineup set:
-# - 30% of lineups: at least one CONTRARIAN play at premium position (QB or RB)
-# - 70% of lineups: mix of LOW-OWNED pivots from projected chalk
-# - 10% of lineups: full fade of the highest-owned player on slate
-```
+**Dispatch prompt:**
+> Activate DFS Lineup Optimizer. Build {n_lineups} lineups for
+> {platform} {sport} {contest_type}. Salary cap: {salary_cap}.
+> Roster config: {roster_config}. Projections: {projections_output}.
+> For CASH: maximize expected median score using integer linear
+> programming. For GPP: maximize ceiling-weighted score with
+> ownership leverage factor (1 / sqrt(projected_ownership)). Apply
+> constraints: salary cap, position slots, max players from single
+> team. For GPP, force at least one correlation stack per lineup
+> (NFL: QB+WR pair; NBA: 3+ players from highest-total game;
+> MLB: 4-player stack vs weakest SP).
 
-**Pivot logic:** Identify the highest-projected player at each position (likely chalk). For 30–40% of lineups, replace chalk with the best projection + lowest ownership alternative at that position.
+**Expected output:** N lineups meeting all constraints with projected scores.
+
+**Checkpoint:**
+
+    Lineups built: {n_lineups} | Type: {contest_type}
+    Avg projected score: [X] | Salary usage: [X]% avg
+    Primary stack: [QB + WR pair or game stack]
+    Proceed to leverage? (yes / rebuild with [constraint] / halt)
 
 ---
 
-### Step 7 — Export CSV
+## Step 5 — Correlation Stacks (no agent dispatch)
 
-**dfs-lineup-optimizer** outputs a formatted CSV ready for bulk upload to DraftKings or FanDuel.
+**Depends on:** Step 4
 
-**DraftKings NFL bulk upload format:**
-```csv
-QB,RB,RB,WR,WR,WR,TE,FLEX,DST
-Patrick Mahomes (KC),Jahmyr Gibbs (DET),Derrick Henry (BAL),...
-...
-```
+**Purpose:** Validate and enforce correlation structures across the lineup set.
 
-**FanDuel NFL bulk upload format:**
-```csv
-QB,RB,RB,WR,WR,WR,TE,FLEX,K
-...
-```
+**Action:** For GPP lineups, verify each lineup contains at least one correlation stack:
 
-```bash
-# Export command
-python agents/dfs/dfs_lineup_optimizer.py export \
-  --projections projections.json \
-  --platform draftkings \
-  --sport nfl \
-  --n-lineups 50 \
-  --contest-type gpp \
-  --output lineups_dk_nfl_2024-11-24.csv
-```
+**NFL stacks:**
+- Primary: QB + WR1 or WR2 from same team (correlation 0.55-0.65)
+- Bring-back: WR or RB from opposing team (benefits from trailing game script)
+- Mini-stack: TE from primary QB's team (correlation 0.45-0.60)
+
+**NBA stacks:**
+- Game stack: 3-4 players from highest projected total game
+- Spread across both teams in the featured game
+
+**MLB stacks:**
+- 4-player minimum stack against weakest SP on slate
+- Batting order correlation: positions 1-4 correlate more strongly
+
+Rotate stacks across the lineup set to maximize ownership differentiation.
+
+**Checkpoint:**
+
+    Stacks validated: N/{n_lineups} lineups have correlation stack
+    Primary stack: [description] — used in [pct]% of lineups
+    Bring-back: [player] — used in [pct]% of lineups
+    Proceed? (yes / force stack [players] / halt)
+
+---
+
+## Step 6 — Ownership Leverage (no agent dispatch)
+
+**Depends on:** Step 5
+
+**Purpose:** Differentiate GPP lineups through ownership-based leverage.
+
+**Action:** Apply leverage tiers to the lineup set:
+- CONTRARIAN (ownership < 5%): high leverage, significant differentiation
+- LOW-OWNED (5-12%): good leverage
+- MEDIUM (12-25%): standard
+- CHALK (25%+): negative leverage in large GPP fields
+
+For a {n_lineups}-lineup set:
+- 30% of lineups: at least one CONTRARIAN play at premium position (QB or RB)
+- 70% of lineups: mix of LOW-OWNED pivots from projected chalk
+- 10% of lineups: full fade of the highest-owned player on slate
+
+For CASH games, skip this step — cash optimizes for floor, not differentiation.
+
+**Checkpoint:**
+
+    Leverage applied: {contest_type}
+    Chalk exposure (>25% own): [player] in [pct]% of lineups
+    Contrarian plays (<8% own): [player] in [pct]% of lineups
+    Full fades: [player] ([own]% ownership) in 0 lineups
+    Proceed to export? (yes / adjust leverage / halt)
+
+---
+
+## Step 7 — Export CSV (no agent dispatch)
+
+**Depends on:** Step 6 (or Step 5 for CASH)
+
+**Purpose:** Export lineups in platform-specific CSV format for bulk upload.
+
+**Action:** Format lineups for {platform} bulk upload:
+
+DraftKings NFL: `QB,RB,RB,WR,WR,WR,TE,FLEX,DST`
+FanDuel NFL: `QB,RB,RB,WR,WR,WR,TE,FLEX,K`
+DraftKings NBA: `PG,SG,SF,PF,C,G,F,UTIL`
+FanDuel NBA: `PG,PG,SG,SG,SF,SF,PF,C`
+
+Save to `output/dfs/{slate_date}/lineups_{platform}_{sport}.csv`.
+
+**Checkpoint:**
+
+    Exported: {n_lineups} lineups to output/dfs/{slate_date}/lineups_{platform}_{sport}.csv
+    Format: {platform} {sport} bulk upload
+    Ready for upload. Verify platform before submitting.
 
 ---
 
@@ -313,41 +292,66 @@ python agents/dfs/dfs_lineup_optimizer.py export \
 
 ```
 ================================================================================
-DFS LINEUP BUILDER — SUMMARY
+DFS LINEUP BUILDER -- SUMMARY
 ================================================================================
-Sport:          NFL
-Platform:       DraftKings
-Slate:          Main Slate — 2024-11-24
-Contest Type:   GPP
-Lineups Built:  50
-Generated:      2024-11-24 10:15 ET
+Sport:          [NFL / NBA / MLB]
+Platform:       [DraftKings / FanDuel]
+Slate:          [Slate Type] -- [YYYY-MM-DD]
+Contest Type:   [GPP / CASH]
+Lineups Built:  [N]
+Generated:      [YYYY-MM-DD HH:MM ET]
 
 TOP PROJECTED PLAYS (by ceiling leverage score):
-  QB:   Patrick Mahomes (KC)    $8,400  |  proj: 28.4 | own: 24% | value: 3.38x
-  RB:   Jahmyr Gibbs (DET)      $7,800  |  proj: 24.1 | own: 18% | value: 3.09x
-  WR:   Puka Nacua (LAR)        $6,200  |  proj: 19.8 | own: 8%  | value: 3.19x  [LEVERAGE]
-  WR:   Travis Kelce (KC)       $6,900  |  proj: 17.2 | own: 31% | value: 2.49x  [CHALK]
-  DST:  Ravens (BAL)            $3,800  |  proj: 12.1 | own: 14% | value: 3.18x
+  [POS]:  [Player] ([Team])    $[salary]  |  proj: [X] | own: [X]% | value: [X]x
+  ...
 
-PRIMARY STACK: Mahomes + Rice + Kelce (KC) — correlation 0.61
-BRING-BACK: Amon-Ra St. Brown (DET) — benefits from KC shootout game script
+PRIMARY STACK: [players] ([team]) -- correlation [X]
+BRING-BACK: [player] ([team]) -- benefits from [game script]
 
 OWNERSHIP EXPOSURE:
-  Chalk plays (>25% own):   Kelce, Mahomes used in 62% of lineups
-  Leverage plays (<8% own): Puka Nacua in 28% of lineups, Gus Edwards in 18%
-  Full fades:               CeeDee Lamb (38% own) in 0 lineups
+  Chalk plays (>25% own):   [players] used in [X]% of lineups
+  Leverage plays (<8% own): [players] in [X]% of lineups
+  Full fades:               [player] ([X]% own) in 0 lineups
 
-OUTPUT: lineups_dk_nfl_2024-11-24.csv (50 lineups, ready for bulk upload)
+OUTPUT: [filename] ([N] lineups, ready for bulk upload)
 ================================================================================
 ```
 
 ---
 
-## Constraints
+## Intervention Commands
 
-- Never project a player with QUESTIONABLE status unless confirmed active within 2 hours of lock.
-- GPP lineups must include at least one player with < 8% projected ownership per lineup.
-- Cash lineups: do not use players with projection floors (P10) below 8 fantasy points. Cash requires floors, not ceilings.
-- Recalculate projections if a significant injury or late scratch is announced after initial run — do not submit stale lineups.
-- DraftKings and FanDuel bulk upload formats differ — never cross-submit. Verify platform before exporting.
-- Log all submitted lineups and contest results to `~/.syndicate/dfs_log.db` for ROI tracking.
+Available at any checkpoint:
+
+| Command | Effect |
+|---------|--------|
+| `yes` / Enter | Proceed to next step |
+| `halt` | Stop the pipeline |
+| `lock [player]` | Force player into all lineups |
+| `exclude [player]` | Remove player from pool |
+| `adjust [n_lineups]` | Change number of lineups |
+| `switch [platform]` | Change target platform |
+| `rebuild` | Re-run optimizer with new constraints |
+
+---
+
+## Decision Rules
+
+- **No QUESTIONABLE players unless confirmed active within 2 hours of lock.** Do not project uncertain availability.
+- **GPP lineups must include at least one player < 8% projected ownership per lineup.** Differentiation is mandatory.
+- **Cash floor minimum.** Do not use players with P10 floor below 8 fantasy points in cash lineups.
+- **Never cross-submit platforms.** DraftKings and FanDuel formats differ. Verify platform before exporting.
+- **Recalculate on late scratch.** If a significant injury or late scratch is announced after Step 3, re-run from Step 2.
+- **Value score minimums.** Cash: 3.0x minimum. GPP: 2.5x minimum (trades value for upside).
+- **Log all lineups.** Log submitted lineups and contest results to `~/.syndicate/bankroll.db` for ROI tracking.
+
+---
+
+## Constraints & Disclaimers
+
+This system is for **educational and research purposes only**. Output is based on Monte Carlo simulations and mathematical optimization. It is not a guarantee of profit and should not be construed as financial or gambling advice.
+
+- DFS involves substantial risk of loss.
+- No model eliminates variance.
+- Bet only what you can afford to lose entirely.
+- **Problem gambling resources:** 1-800-522-4700 | ncpgambling.org

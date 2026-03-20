@@ -76,10 +76,10 @@ These rules are enforced regardless of which workflow is running:
 | Workflow | File | Status |
 |----------|------|--------|
 | Daily Picks Pipeline | `workflows/daily-picks.md` | Converted to dispatch format |
-| Pregame Research Package | `workflows/pregame-research.md` | Legacy format (not yet converted) |
-| Arbitrage Scanner | `workflows/arb-scan.md` | Legacy format (not yet converted) |
-| DFS Lineup Builder | (not yet created) | Legacy format (not yet converted) |
-| Morning Line Sync | (not yet created) | Legacy format (not yet converted) |
+| Pregame Research Package | `workflows/pregame-research.md` | Converted to dispatch format |
+| Arbitrage Scanner | `workflows/arb-scan.md` | Converted to dispatch format |
+| DFS Lineup Builder | `workflows/dfs-lineup-builder.md` | Converted to dispatch format |
+| Morning Line Sync | (not yet created) | Not yet created |
 
 ## Communication Style
 

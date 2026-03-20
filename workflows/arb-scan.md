@@ -1,71 +1,35 @@
 # Arb Scan Workflow
 
-Continuous polling workflow: pull odds across books and Polymarket → detect arbitrage → find middles → size stakes → alert. Designed to run as a persistent background process.
-
----
+> **Hybrid pipeline:** Claude Code auto-chains agents and surfaces checkpoints
+> between steps. Supports one-shot scans and continuous polling mode.
 
 ## How to Run
 
-### Claude Code (recommended)
+Activate the **Sharp Orchestrator** agent in Claude Code and prompt:
 
-Open Claude Code in the `the-syndicate` repo, select the **Sharp Orchestrator** or **Arb Scanner** agent, then prompt:
-
-```
-Run the arb scan workflow for NFL. Poll every 60 seconds, minimum 0.5% profit.
-```
-
-Claude Code will write and execute the polling loop, scan for arbs across books + Polymarket, and output structured alerts. It can also record found arbs to your bankroll state.
+    Run the arb scan workflow for [SPORT]. Poll every 60 seconds, minimum 0.5% profit.
 
 For a one-shot scan (no continuous polling):
-```
-Scan for NFL arbitrage opportunities right now across all books and Polymarket.
-```
 
-### Claude Desktop
+    Scan for [SPORT] arbitrage opportunities right now across all books and Polymarket.
 
-Not directly supported. You can paste odds from multiple sportsbooks into Claude Desktop and ask it to check for arbs using the formulas in this doc, but it cannot poll APIs or maintain a persistent loop.
+The orchestrator reads this workflow and executes each step.
 
-### CLI (standalone)
+## Inputs
 
-The code blocks in this doc and the agent files (`agents/arbitrage/arb-scanner.md`, `agents/arbitrage/middle-finder.md`) contain working Python. To run the scan loop independently:
-
-```bash
-pip install requests aiohttp
-export ODDS_API_KEY=your_key_here
-
-# Build a script from the code blocks in arb-scanner.md and this workflow,
-# or prompt Claude Code to generate a standalone arb_scan.py for you.
-```
-
-To record arb bets:
-```bash
-./scripts/bet.sh place    # Leg 1
-./scripts/bet.sh place    # Leg 2
-```
-
----
-
-## Sport Context
-
-Set sport before launching. The scanner targets one sport per process instance. Run multiple instances for multi-sport coverage — one process per sport key.
-
-```
-SPORT_KEY: [americanfootball_nfl | basketball_nba | baseball_mlb | icehockey_nhl | ...]
-POLL_INTERVAL: 60  # seconds between scans
-BANKROLL_DB: ~/.syndicate/bankroll.db
-MIN_PROFIT_PCT: 0.5  # minimum guaranteed profit % to alert
-```
-
----
+- `{sport}` — The Odds API sport key (e.g., `americanfootball_nfl`, `basketball_nba`)
+- `{poll_interval}` — Seconds between scans in continuous mode (default: 60)
+- `{min_profit_pct}` — Minimum guaranteed profit % to alert (default: 0.5)
 
 ## Agents Involved
 
-| Agent | Role | Output |
-|-------|------|--------|
-| `odds-scraper` | Pulls multi-book odds from The Odds API; fetches Polymarket CLOB | `odds_snapshot.json` |
-| `arb-scanner` | Detects two-way and three-way arb conditions across books | `arbs_detected.json` |
-| `middle-finder` | Scans for middling opportunities on spread divergence | `middles_detected.json` |
-| `kelly-criterion` | Sizes arb stakes from bankroll; applies max per-book exposure limits | `arb_stakes.json` |
+| Step | Agent | Role |
+|------|-------|------|
+| 1 | Odds Scraper | Pull multi-book odds + Polymarket CLOB |
+| 2 | Arb Scanner | Detect two-way and three-way arb conditions |
+| 3 | Middle Finder | Scan for middling opportunities on spread divergence |
+| 4 | Kelly Criterion Manager | Size arb stakes from bankroll |
+| 5 | (orchestrator) | Emit alerts and log to database |
 
 ---
 
@@ -106,7 +70,7 @@ GET {POLYMARKET_BASE}/markets?active=true&tag_slug=nfl
 GET {POLYMARKET_BASE}/book?token_id={condition_id}
 
 # Price interpretation:
-# Polymarket prices are 0–1 (probability).
+# Polymarket prices are 0-1 (probability).
 # Convert to American moneyline for arb math:
 def poly_prob_to_american(prob: float) -> float:
     if prob >= 0.5:
@@ -116,116 +80,147 @@ def poly_prob_to_american(prob: float) -> float:
 ```
 
 **Polymarket integration notes:**
-- Bid/ask spread on Polymarket is the effective juice. Use the BID price for "Yes" (buying the outcome) — this is what you can sell at if the bet loses its value.
+- Bid/ask spread on Polymarket is the effective juice. Use the BID price for "Yes" (buying the outcome).
 - Polymarket settles on game result. No live withdrawal once position is open.
-- Maximum effective size on Polymarket: ~$5,000 per position before significant market impact.
-- Best arbs with Polymarket appear in the 30–60 minutes before game time when sportsbooks shade lines but Polymarket lags.
+- Maximum effective size: ~$5,000 per position before significant market impact.
+- Best arbs appear 30-60 minutes before game time when sportsbooks shade lines but Polymarket lags.
 
 ---
 
-## Pipeline Steps
+## Step 1 — Odds Scraper
 
-### Step 1 — Pull Odds Snapshot
+**Agent:** Odds Scraper
+**Depends on:** none
+**Dispatch mode:** foreground
 
-Invoke **odds-scraper** to fetch current odds from all sources simultaneously.
+**Purpose:** Pull current odds from all sportsbooks and Polymarket simultaneously.
 
-```python
-# Parallel fetch: The Odds API + Polymarket
-odds_snap = {
-    "sport_key":    SPORT_KEY,
-    "fetched_at":   datetime.utcnow().isoformat(),
-    "books":        fetch_odds_api(SPORT_KEY),       # odds-scraper
-    "polymarket":   fetch_polymarket_markets(SPORT_KEY),  # odds-scraper
-}
-```
+**Dispatch prompt:**
+> Activate Odds Scraper. Pull current odds for {sport} from The Odds
+> API. Use the `ODDS_API_KEY` environment variable. Markets: h2h,
+> spreads, totals. Regions: us, uk, eu. Odds format: american. Also
+> fetch Polymarket CLOB prices for any matching {sport} event
+> contracts. Return a unified odds snapshot with: each game, each
+> book's prices (including Polymarket converted to American odds),
+> and a fetch timestamp. Flag the snapshot timestamp — if older than
+> 120 seconds, it must be re-fetched before scanning.
 
-**Freshness gate:** If The Odds API snapshot is older than 120 seconds, re-fetch before scanning. Stale odds are worse than no odds — they produce phantom arbs that evaporate on execution.
+**Expected output:** Unified odds snapshot across all books + Polymarket with timestamps per game.
 
----
+**Checkpoint:**
 
-### Step 2 — Run Arb Scanner
-
-Invoke **arb-scanner** on the full odds snapshot. Scanner checks every book-vs-book combination and every book-vs-Polymarket combination.
-
-```python
-# arb-scanner logic:
-# For each event, for each market (h2h, spreads, totals):
-#   Find best price per outcome across all sources (books + Polymarket)
-#   Calculate arb_pct = sum(1/decimal_odds_i for each outcome)
-#   If arb_pct < 1.0: arb exists. Profit % = (1 - arb_pct) * 100
-#   If profit_pct >= MIN_PROFIT_PCT: add to arbs_detected
-```
-
-**Polymarket arb check:**
-```python
-# Example: DraftKings has KC -160, Polymarket has BUF Yes @ 0.43 (implied +132)
-# Leg 1: KC ML @ DraftKings -160 (decimal 1.625)
-# Leg 2: BUF Yes @ Polymarket bid 0.43 → decimal 1/0.43 = 2.326
-# arb_pct = 1/1.625 + 1/2.326 = 0.615 + 0.430 = 1.045  → NO ARB
-# If BUF bid were 0.47: 1/1.625 + 1/(1/0.47) = 0.615 + 0.470 = 1.085 → still no
-# True arb requires arb_pct < 1.0 — Polymarket must offer better than no-vig parity
-```
-
-Output: `arbs_detected.json` with all qualifying arbs sorted by `profit_pct` descending.
+    Odds snapshot: N games, N books + Polymarket | Timestamp: HH:MM:SS UTC
+    Freshness: OK (< 120s) or STALE (re-fetch required)
+    Proceed? (yes / re-fetch / halt)
 
 ---
 
-### Step 3 — Run Middle Finder
+## Step 2 — Arb Scanner
 
-Invoke **middle-finder** on the spread data. Middles differ from arbs: you win both legs if the final margin lands in the middle window.
+**Agent:** Arb Scanner
+**Depends on:** Step 1 (fresh snapshot)
+**Dispatch mode:** foreground
 
-```python
-# middle-finder logic:
-# For each event's spread market:
-#   Find the highest available number on Team A (e.g., +7.5 at FanDuel)
-#   Find the lowest available number on Team B (e.g., -6.5 at DraftKings)
-#   If (best_dog_spread - best_fav_spread) > 0: middle window exists
-#   Middle window = [best_fav_spread, best_dog_spread]
-#   Width = best_dog_spread - best_fav_spread (e.g., 1.0 pt = narrow middle)
-#   EV calculation: P(middle lands) * (win_both_legs profit) - P(push one leg) * (lose one leg)
-```
+**Purpose:** Detect guaranteed-profit arbitrage opportunities across all book combinations.
 
-Middle alert threshold:
-- NFL: window ≥ 1.0 point, centered on a key number (3, 7, 10, 14) → high priority
-- NBA: window ≥ 2.0 points, centered on 5 or 7
-- MLB: middle on run line is rare; filter to ≥ 0.5 run window
+**Dispatch prompt:**
+> Activate Arb Scanner. Scan this odds snapshot for arbitrage
+> opportunities: {odds_snapshot}. For each event and market (h2h,
+> spreads, totals), find the best price per outcome across all
+> sources (sportsbooks + Polymarket). Calculate arb coefficient as
+> sum(1/decimal_odds_i) for each outcome set. If coefficient < 1.0,
+> an arb exists with profit % = (1 - coefficient) * 100. Include
+> book-vs-book and book-vs-Polymarket combinations. Filter to arbs
+> with profit >= {min_profit_pct}%. Output all qualifying arbs
+> sorted by profit % descending. For three-way markets (soccer h2h),
+> apply 1.0% minimum profit threshold.
 
----
+**Expected output:** List of qualifying arbs with event, market, legs (outcome + book + odds), arb coefficient, and profit %.
 
-### Step 4 — Load Bankroll and Size Stakes
+**Checkpoint:**
 
-Read bankroll from `~/.syndicate/bankroll.db`. Calculate arb stakes using **kelly-criterion**'s arb sizing module.
-
-```python
-# For arbs: stake distribution to guarantee equal profit on all outcomes
-# kelly-criterion handles arb sizing differently than edge bets:
-# No Kelly fraction — arb profit is locked in. Stake = total_arb_budget / arb_pct.
-# total_arb_budget = min(max_arb_stake, available_bankroll * arb_allocation_pct)
-
-ARB_ALLOCATION_PCT = 0.15  # max 15% of current bankroll per arb
-MAX_ARB_STAKE = 1000.0     # hard cap per arb execution
-
-# Per-book exposure limit (account health):
-MAX_PER_BOOK_PER_DAY = 500.0
-```
+    Arbs found: N qualifying (profit >= {min_profit_pct}%)
+    Top arb: [event] [market] — [profit]% guaranteed
+    Sources: N book-vs-book, N book-vs-Polymarket
+    Proceed? (yes / skip to middles / halt)
 
 ---
 
-### Step 5 — Alert
+## Step 3 — Middle Finder
 
-For each arb above threshold, emit a structured alert (see format below) and log to `~/.syndicate/arb_log.db`.
+**Agent:** Middle Finder
+**Depends on:** Step 1 (odds snapshot)
+**Dispatch mode:** foreground
 
-Alert channels (configure in `.env`):
-- Terminal: always
-- Slack webhook: if `SLACK_WEBHOOK_URL` is set
-- Pushover mobile: if `PUSHOVER_TOKEN` is set
+**Purpose:** Identify middling opportunities where spread divergence creates a window to win both sides.
 
-```bash
-# Execution priority: place soft book first, sharp book second
-# Soft books (recreational, higher slip risk): DraftKings, FanDuel, BetMGM, Caesars
-# Sharp books (lower slip risk, harder to limit): Pinnacle, Circa, BetOnline
-# Polymarket: place last — no line movement risk but settlement delay
-```
+**Dispatch prompt:**
+> Activate Middle Finder. Scan the spread data from this odds
+> snapshot: {odds_snapshot}. For each event, find the highest
+> available dog number and lowest available favorite number across
+> all books. If (best_dog_spread - best_fav_spread) > 0, a middle
+> window exists. Calculate the middle width, identify if it's
+> centered on a key number (NFL: 3, 7, 10, 14; NBA: 5, 7), and
+> estimate the EV based on historical probability of landing in the
+> window. Filter by sport-specific thresholds: NFL >= 1.0 point
+> window, NBA >= 2.0 points, MLB >= 0.5 runs.
+
+**Expected output:** List of middle opportunities with event, window, key number flag, legs (book + spread + odds), and estimated EV.
+
+**Checkpoint:**
+
+    Middles found: N opportunities
+    Top middle: [event] — [spread range] ([width] pt window, key number: [yes/no])
+    Proceed to sizing? (yes / skip / halt)
+
+---
+
+## Step 4 — Kelly Criterion Manager (Arb Sizing)
+
+**Agent:** Kelly Criterion Manager
+**Depends on:** Steps 2 + 3 + bankroll state
+**Dispatch mode:** foreground
+
+**Purpose:** Size arb and middle stakes from current bankroll with per-book exposure limits.
+
+**Dispatch prompt:**
+> Activate Kelly Criterion Manager. Size stakes for the following
+> arb and middle opportunities. Read bankroll from
+> ~/.syndicate/bankroll.db. For arbs, use guaranteed-profit sizing
+> (not Kelly fraction — arbs have locked profit). Allocate max 15%
+> of current bankroll per arb execution, hard cap $1,000 per arb.
+> Enforce per-book daily exposure limit of $500. For middles, size
+> based on EV using quarter-Kelly with the estimated middle
+> probability. Arbs: {arbs_detected}. Middles: {middles_detected}.
+> Output: per-leg stakes, total staked, guaranteed profit (arbs) or
+> expected profit (middles), and remaining per-book exposure.
+
+**Expected output:** Sized arb and middle stakes with per-leg dollar amounts, total exposure, and profit calculations.
+
+**Checkpoint:**
+
+    Arbs sized: N | Total staked: $X | Guaranteed profit: $X
+    Middles sized: N | Total staked: $X | Expected profit: $X
+    Per-book exposure: [book]: $X/$500 remaining
+    Execute? (yes / adjust / skip [arb/middle] / halt)
+
+---
+
+## Step 5 — Alert and Log (no agent dispatch)
+
+**Depends on:** Step 4
+
+**Purpose:** Emit structured alerts and log all detected opportunities.
+
+**Action:** For each sized arb and middle, emit a structured alert using the formats below. Log every detected opportunity (executed or not) to `~/.syndicate/bankroll.db` via State Manager.
+
+**Execution priority:** Place soft book leg first (DraftKings, FanDuel, BetMGM, Caesars), sharp book second (Pinnacle, Circa, BetOnline), Polymarket last.
+
+**Checkpoint:**
+
+    Alerts emitted: N arbs, N middles
+    Logged to database: N opportunities
+    Next scan in {poll_interval} seconds (continuous mode) or DONE (one-shot)
 
 ---
 
@@ -268,7 +263,7 @@ EXECUTION:
   [ ] Place Leg 1 at [Book] — confirm fill before Leg 2
   [ ] Place Leg 2 at [Book] within 60 seconds of Leg 1
   [ ] Re-verify both lines have not moved before placing Leg 2
-  [ ] Log execution in ~/.syndicate/arb_log.db
+  [ ] Log execution in ~/.syndicate/bankroll.db
 ================================================================================
 ```
 
@@ -289,7 +284,7 @@ LEG 2:  [Away] +7.5 @ [FanDuel]     -110  |  Stake: $[XXX]
 
 Scenarios:
   Win both:  Final margin = exactly 7 → +$[XXX.XX] (both legs win)
-  Win one:   Final margin ≠ 6–7 → -$[XX.XX] (standard single-side loss)
+  Win one:   Final margin ≠ 6-7 → -$[XX.XX] (standard single-side loss)
   Push one:  Final margin = 6.5 or 7.5 → roughly break even
 
 Middle EV (assuming 12% P(middle) on key number 7):
@@ -301,29 +296,48 @@ Middle EV (assuming 12% P(middle) on key number 7):
 
 ## Continuous Poll Loop
 
-```python
-while True:
-    snap = fetch_odds_snapshot(SPORT_KEY)             # odds-scraper
-    arbs = arb_scanner.scan(snap)                     # arb-scanner
-    middles = middle_finder.scan(snap)                # middle-finder
-    sized = kelly_criterion.size_arbs(arbs, bankroll) # kelly-criterion
+In continuous mode, the orchestrator repeats Steps 1-5 every `{poll_interval}` seconds. Between cycles:
 
-    for arb in sized:
-        emit_alert(arb)
-        log_arb(arb, "~/.syndicate/arb_log.db")
-
-    for middle in middles:
-        emit_middle_alert(middle)
-
-    sleep(POLL_INTERVAL)
-```
+    Cycle N complete | Arbs: X found, X sized | Middles: X found
+    Next scan in {poll_interval}s | Total cycles: N | Session arbs: X
+    Continue polling? (yes / pause / halt)
 
 ---
 
-## Constraints
+## Intervention Commands
 
-- Never hold a single-sided position. If Leg 1 fills and Leg 2 moves out of arb range, exit Leg 1 immediately at market.
-- Do not arb the same game on the same book more than 3 times per week — account longevity matters more than any single arb.
-- Polymarket legs require 30-second confirmation of order fill before Leg 1 is placed on the sportsbook side.
-- Three-way arbs (soccer h2h): minimum profit threshold is 1.0% — added complexity and three-leg slip risk demands higher floor.
-- Log every detected arb regardless of execution. Pattern analysis of missed arbs reveals optimal poll intervals and book combinations.
+Available at any checkpoint:
+
+| Command | Effect |
+|---------|--------|
+| `yes` / Enter | Proceed to next step |
+| `halt` | Stop the pipeline / polling |
+| `re-fetch` | Re-pull odds (if stale) |
+| `skip [arb/middle]` | Exclude a specific opportunity |
+| `adjust` | Override stake sizing |
+| `pause` | Pause continuous polling (resume with "yes") |
+
+---
+
+## Decision Rules
+
+- **120-second freshness gate.** If odds snapshot is older than 120 seconds, re-fetch before scanning. Stale odds produce phantom arbs.
+- **Minimum profit floor.** Only alert on arbs with profit >= `{min_profit_pct}%` (default 0.5%).
+- **Three-way arb floor.** Soccer h2h (three outcomes) requires minimum 1.0% profit — added complexity and three-leg slip risk.
+- **Per-book daily exposure.** Max $500 per book per day to preserve account longevity.
+- **Same-game cap.** Do not arb the same game on the same book more than 3 times per week.
+- **Polymarket fill confirmation.** Polymarket legs require 30-second confirmation of order fill before placing the sportsbook leg.
+- **Single-sided position prohibition.** Never hold a single-sided position. If Leg 1 fills and Leg 2 moves out of arb range, exit Leg 1 immediately at market.
+- **15% bankroll allocation cap.** Max 15% of current bankroll per arb execution, hard cap $1,000.
+- **Log everything.** Log every detected arb regardless of execution — pattern analysis reveals optimal poll intervals and book combinations.
+
+---
+
+## Constraints & Disclaimers
+
+This system is for **educational and research purposes only**. Output is based on mathematical models and real-time odds data. It is not a guarantee of profit and should not be construed as financial or gambling advice.
+
+- Arb opportunities can disappear in seconds. Line movement between legs creates slip risk.
+- Sports betting involves substantial risk of loss.
+- Bet only what you can afford to lose entirely.
+- **Problem gambling resources:** 1-800-522-4700 | ncpgambling.org

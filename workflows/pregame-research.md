@@ -1,231 +1,248 @@
 # Pregame Research Workflow
 
-Deep research workflow for a single game. Produces a comprehensive research brief covering injuries, weather, situational spots, breaking news, and model output — synthesized into a final verdict with confidence tier and CLV target.
-
----
+> **Hybrid pipeline:** Claude Code auto-chains agents and surfaces checkpoints
+> between steps. Deep research for a single game — produces a comprehensive
+> brief with confidence tier and bet recommendation.
 
 ## How to Run
 
-### Claude Code (recommended)
+Activate the **Sharp Orchestrator** agent in Claude Code and prompt:
 
-Open Claude Code in the `the-syndicate` repo, select the **Pregame Researcher** or **Sharp Orchestrator** agent, then prompt:
+    Run the pregame research workflow for [AWAY] at [HOME], [SPORT], [DATE TIME].
 
-```
-Run the pregame research workflow for Bills at Chiefs, NFL, November 24 2024 4:25pm ET.
-```
+For targeted sub-steps:
 
-Claude Code will execute all 7 steps — pulling injury data, checking weather, analyzing the schedule spot, scanning for breaking news, collecting stats, running the market-maker model, and synthesizing a final research brief.
+    Run just the injury and weather checks for Bills at Chiefs.
 
-You can also run targeted sub-steps:
-```
-Run just the injury and weather checks for Bills at Chiefs.
-```
+The orchestrator reads this workflow and executes each step.
 
-### Claude Desktop
+## Inputs
 
-Partially supported. You can prompt Claude Desktop with game context and ask it to fill in the research brief template (copy the output template from this doc). It won't be able to call live APIs, but it can reason about matchups, situational angles, and betting strategy using its training data.
-
-### CLI (standalone)
-
-Individual steps use real APIs with working Python in the agent files. Key dependencies:
-
-```bash
-pip install nba_api nfl-data-py pybaseball requests
-# Weather (no API key needed): Open-Meteo
-# Injury data: ESPN undocumented API (no key)
-# Odds: requires ODDS_API_KEY from the-odds-api.com
-```
-
-The pipeline steps reference code in `agents/research/pregame-researcher.md`, `agents/data/injury-monitor.md`, `agents/data/meteorologist.md`, etc. There is no single CLI script — the orchestration happens through Claude Code agent chaining.
-
----
-
-## Sport Context
-
-This workflow targets one specific game. Set context before running. Research depth and agent routing depend on the sport.
-
-```
-SPORT:      [NFL | NBA | MLB | NHL | NCAAF | NCAAB]
-HOME_TEAM:  [team abbreviation]
-AWAY_TEAM:  [team abbreviation]
-GAME_TIME:  [YYYY-MM-DD HH:MM ET]
-GAME_ID:    [internal ID, e.g. nfl_2024_wk12_buf_at_kc]
-```
-
-Example:
-```
-SPORT:      NFL
-HOME_TEAM:  KC
-AWAY_TEAM:  BUF
-GAME_TIME:  2024-11-24 16:25 ET
-GAME_ID:    nfl_2024_wk12_buf_at_kc
-```
-
----
+- `{sport}` — Sport key (e.g., `NFL`, `NBA`, `MLB`, `NHL`, `NCAAF`, `NCAAB`)
+- `{away_team}` — Away team name or abbreviation
+- `{home_team}` — Home team name or abbreviation
+- `{game_time}` — Game date and time (e.g., `2026-03-19 16:25 ET`)
 
 ## Agents Involved
 
-| Agent | Role | Invoked For |
-|-------|------|-------------|
-| `injury-monitor` | Official injury designations + beat reporter updates | All sports |
-| `meteorologist` | Game-time weather forecast at venue | NFL, MLB, NCAAF outdoor only |
-| `situational-analyst` | Rest, travel, schedule spots, divisional/revenge angles | All sports |
-| `the-insider` | Breaking news, locker room intel, coaching changes | All sports |
-| `stats-collector` | Recent form, ATS/O-U splits, efficiency metrics | All sports |
-| `market-maker` | Independent fair-value spread, total, moneyline | All sports |
+| Step | Agent | Role |
+|------|-------|------|
+| 1 | Injury Monitor | Official designations + beat reporter updates |
+| 2 | Meteorologist | Weather forecast (outdoor sports only) |
+| 3 | Situational Analyst | Rest, travel, schedule spots, angles |
+| 4 | The Insider | Breaking news, locker room intel |
+| 5 | Stats Collector | ATS/O-U records, efficiency, H2H |
+| 6 | Market Maker | Independent fair-value spread, total, ML |
+| 7 | (orchestrator) | Synthesis into research brief |
 
 ---
 
-## Pipeline Steps
+## Step 1 — Injury Monitor (parallel with Steps 2-5)
 
-### Step 1 — Injury Monitor
+**Agent:** Injury Monitor
+**Depends on:** none
+**Dispatch mode:** background (parallel with Steps 2-5)
 
-Invoke **injury-monitor** for both teams. This step runs first because injury status is the most time-sensitive input and the most common reason to abort a bet.
+**Purpose:** Pull official injury designations and beat reporter updates for both teams.
 
-**injury-monitor** pulls from:
-- Official league injury report (NFL: Wednesday/Thursday/Friday designations)
-- ESPN injury API (`site.api.espn.com/apis/site/v2/sports/{sport}/{league}/teams/{team}/injuries`)
-- Rotowire live updates
-- Beat reporter cross-check (Twitter/X search for team beat reporters)
+**Dispatch prompt:**
+> Activate Injury Monitor. Pull the current injury report for
+> {away_team} vs {home_team}. Sport: {sport}. Check official league
+> injury reports, ESPN injury API, Rotowire live updates, and beat
+> reporter cross-checks. For each injured player, report: name,
+> position, status (OUT/DOUBTFUL/QUESTIONABLE/PROBABLE), description,
+> and impact tier (CRITICAL/HIGH/MODERATE/LOW). CRITICAL = starting QB
+> or franchise player (30+ min/g). HIGH = WR1/RB1/TE1 or starting
+> PG/SF. MODERATE = OL starter or key defender. LOW = backup or
+> special teams. If a CRITICAL injury is unresolved within 90 minutes
+> of game time, flag for confidence downgrade.
 
-**Injury impact tiers:**
+**Expected output:** Injury report for both teams with impact tiers and point adjustments.
 
-| Tier | Player Type | Impact |
-|------|-------------|--------|
-| CRITICAL | Starting QB (NFL), franchise player (NBA: 30+ min/g) | Revisit model entirely |
-| HIGH | WR1/RB1/TE1 (NFL), starting PG/SF (NBA) | Adjust model -1.5 to -3 pts |
-| MODERATE | OL starter (NFL), key defender | Adjust model -0.5 to -1.5 pts |
-| LOW | Backup, special teams | Note only, no model adjustment |
+**Checkpoint:**
 
-**Gate:** If CRITICAL injury is reported with no resolution within 90 minutes of game time, downgrade confidence to C or PASS.
-
----
-
-### Step 2 — Meteorologist (outdoor sports only)
-
-**Skip for:** NBA, NHL, indoor arenas, dome stadiums.
-
-Invoke **meteorologist** for NFL outdoor venues, MLB (all parks), NCAAF outdoor.
-
-**meteorologist** pulls from Open-Meteo API (free, no key):
-```
-GET https://api.open-meteo.com/v1/forecast
-    ?latitude={LAT}&longitude={LON}
-    &hourly=temperature_2m,precipitation_probability,windspeed_10m,winddirection_10m
-    &temperature_unit=fahrenheit&windspeed_unit=mph
-```
-
-**Weather betting impact thresholds:**
-
-| Condition | Threshold | O/U Impact | Spread Impact |
-|-----------|-----------|------------|---------------|
-| Wind | 15–24 mph | Lean under 0.5–1.5 pts | Minimal |
-| Wind | 25+ mph | Strong under, 2–3 pts | Favors run game (+ground team) |
-| Temperature | ≤ 20°F | Slight under lean | Favors home team familiarity |
-| Precipitation | ≥ 40% chance | Moderate under lean | Toss-up |
-| Precipitation | ≥ 70% chance | Strong under 1–2 pts | Slight home lean |
+    Injuries: [away_team] N players listed | [home_team] N players listed
+    Impact: [CRITICAL/HIGH/MODERATE/NONE] — [summary]
+    Gate: [CLEAR / CRITICAL INJURY — confidence capped at C]
+    Proceed? (yes / re-check [team] / halt)
 
 ---
 
-### Step 3 — Situational Analyst
+## Step 2 — Meteorologist (parallel with Steps 1, 3-5)
 
-Invoke **situational-analyst** to identify schedule spots and motivational edges. These are the factors books price last and the public ignores most.
+**Agent:** Meteorologist
+**Depends on:** none
+**Dispatch mode:** background (parallel with Steps 1, 3-5)
+**Skip for:** NBA, NHL, indoor arenas, dome stadiums
 
-**situational-analyst** checks (sport-specific):
+**Purpose:** Forecast game-time weather and quantify impact on scoring.
 
-**NFL:**
-- Rest days: short week (≤4 days), bye advantage (14 days), off-bye opponent
-- Travel: time zone crossings, coast-to-coast road trip
-- Divisional game: tighter spreads historically, higher variance
-- Primetime: road teams cover at lower rate, top teams underperform vs. number
-- Revenge spot: team facing former head coach, former franchise QB
-- Look-ahead: game sandwiched between two marquee opponents
-- Desperation: must-win for playoff positioning (cover rate +5% historically)
+**Dispatch prompt:**
+> Activate Meteorologist. Pull the weather forecast for {away_team}
+> vs {home_team} at game time {game_time}. Sport: {sport}. Use the
+> Open-Meteo API (free, no key needed) with the venue's GPS
+> coordinates. Report: temperature, wind speed + direction,
+> precipitation probability. Quantify impact on total (O/U) and
+> spread using these thresholds: wind 15-24 mph = lean under 0.5-1.5
+> pts; wind 25+ mph = strong under 2-3 pts + favors run game;
+> temp <= 20F = slight under + favors home; precip >= 40% = moderate
+> under; precip >= 70% = strong under 1-2 pts + slight home lean.
+> Note any venue-specific concerns (open end zones, altitude).
 
-**NBA:**
-- Back-to-back: second night of B2B — dogs cover at elevated rate vs. rested opponent
-- 3-in-4: fatigue spot, especially road
-- Rest differential: 3+ days rest vs. 1 day rest = 2–3 point model adjustment
+**Expected output:** Weather forecast with quantified O/U and spread impact in points.
 
-**MLB:**
-- Starting pitcher on short rest (< 4 days) → downgrade SP confidence
-- Travel: east-to-west late arrival (affects first-inning scoring)
-- Getaway day game: day game following night game (fatigue)
+**Checkpoint:**
 
----
-
-### Step 4 — The Insider
-
-Invoke **the-insider** to surface breaking news not yet captured in official reports or pricing. This agent scans:
-- Beat reporter feeds (Twitter/X)
-- Injury report updates within 24 hours of game time
-- Practice participation reports (full, limited, non-participant)
-- Coaching changes, coordinator adjustments
-- Motivational intel: player controversies, trade rumors, contract disputes
-- Any news the line hasn't priced yet
-
-**Output:** A timestamped news log for the game, flagged by potential betting relevance (HIGH / MEDIUM / LOW).
-
-**Important:** The Insider output is the most perishable data in the pipeline. Run this step last among the data-gathering steps, as close to game time as operationally feasible, and re-run 30 minutes before kickoff/tip.
+    Weather at [venue]: [temp]F, wind [speed] mph [dir], precip [pct]%
+    O/U impact: [SEVERE/MODERATE/MINIMAL] — [+/- X pts]
+    Spread impact: [description]
+    Proceed? (yes / skip / halt)
 
 ---
 
-### Step 5 — Stats Collector
+## Step 3 — Situational Analyst (parallel with Steps 1-2, 4-5)
 
-Invoke **stats-collector** to pull structured statistical data for both teams.
+**Agent:** Situational Analyst
+**Depends on:** none
+**Dispatch mode:** background (parallel with Steps 1-2, 4-5)
 
-**stats-collector** targets (sport-specific):
+**Purpose:** Identify schedule spots, rest edges, and motivational factors.
 
-**NFL stats pulled:**
-- Season ATS record: overall, home, away, favorite, dog
-- O/U record: overall, home, away, in outdoor games
-- Efficiency: EPA/play offense/defense, DVOA, yards per play
-- Recent form: ATS last 5 games
-- H2H: ATS record last 5 meetings, O/U last 5 meetings
-- Situational splits matching the spot (e.g., home as 3–7 point favorite)
+**Dispatch prompt:**
+> Activate Situational Analyst. Analyze the situational context for
+> {away_team} vs {home_team} on {game_time}. Sport: {sport}. Check:
+> rest days for both teams, travel (time zones, coast-to-coast),
+> schedule spot (short week, off-bye, look-ahead, letdown,
+> sandwich), divisional rivalry, primetime factors, revenge spots
+> (former coach/QB), and desperation (playoff positioning). For NBA,
+> specifically check back-to-back and 3-in-4 fatigue. For MLB,
+> check SP rest days and getaway day. Output a rest edge in points,
+> schedule spot flags, and any motivational angles with historical
+> cover rate impact.
 
-**NBA stats pulled:**
-- ATS record: overall, home, away, off rest, on B2B
-- Pace: possessions per 48 minutes (both teams)
-- Offensive/defensive efficiency ratings
-- H2H last 5, ATS last 5
+**Expected output:** Rest differential, schedule spot flags, motivational angles with point adjustments.
 
-**MLB stats pulled:**
-- Team ERA vs. lineup handedness splits
-- Bullpen availability (days of rest for key arms)
-- Recent batting performance: last 10 games runs scored/allowed
-- Starting pitcher: recent ERA, WHIP, pitch count limits
+**Checkpoint:**
 
----
-
-### Step 6 — Market Maker
-
-Invoke **market-maker** to produce an independent fair-value number using research brief inputs.
-
-Inject the following from prior steps into **market-maker**'s inputs:
-- Injury adjustments from Step 1 (point value per position)
-- Weather adjustments from Step 2 (total impact in points)
-- Rest differential from Step 3
-
-**market-maker** outputs:
-- Fair spread (home team perspective)
-- Fair total
-- No-vig moneylines
-- Implied win probability each side
-- Edge vs. current market line (if provided)
+    Rest edge: [team] +[X] days — model adjustment [+/- X.X pts]
+    Schedule spots: [list of flags]
+    Motivation: [angles identified or "none"]
+    Proceed? (yes / deep dive / halt)
 
 ---
 
-### Step 7 — Synthesis
+## Step 4 — The Insider (parallel with Steps 1-3, 5)
 
-Combine all agent outputs into the final research brief. Apply the confidence framework:
+**Agent:** The Insider
+**Depends on:** none
+**Dispatch mode:** background (parallel with Steps 1-3, 5)
+
+**Purpose:** Surface breaking news not yet captured in official reports or pricing.
+
+**Dispatch prompt:**
+> Activate The Insider. Scan for breaking news on {away_team} vs
+> {home_team}. Sport: {sport}. Game time: {game_time}. Check beat
+> reporter feeds, practice participation reports, coaching changes,
+> coordinator adjustments, player controversies, trade rumors, and
+> contract disputes. Flag each item by betting relevance:
+> HIGH (likely moves the line), MEDIUM (could affect game flow),
+> LOW (background context). Timestamp each item. This data is highly
+> perishable — note the scan time. If a HIGH-relevance item is found
+> after the brief is issued, the full pipeline should be re-run.
+
+**Expected output:** Timestamped news log flagged by relevance tier.
+
+**Checkpoint:**
+
+    News scan: N items found | HIGH: N | MEDIUM: N | LOW: N
+    Top item: [timestamp] [summary] — relevance: [tier]
+    Proceed? (yes / re-scan / halt)
+
+---
+
+## Step 5 — Stats Collector (parallel with Steps 1-4)
+
+**Agent:** Stats Collector
+**Depends on:** none
+**Dispatch mode:** background (parallel with Steps 1-4)
+
+**Purpose:** Pull structured statistical data for both teams.
+
+**Dispatch prompt:**
+> Activate Stats Collector. Pull stats for {away_team} vs
+> {home_team}. Sport: {sport}. Collect: season ATS record (overall,
+> home, away, as favorite, as dog), O/U record (overall, home, away),
+> last 5 games ATS and O/U, H2H last 5 meetings (ATS and O/U),
+> efficiency metrics (NFL: EPA/play, DVOA; NBA: offensive/defensive
+> rating, pace; MLB: team ERA, bullpen availability), and situational
+> splits matching this specific spot. Minimum 10-game sample for any
+> trend cited. Output structured data, not narrative.
+
+**Expected output:** Structured stats with ATS/O-U records, efficiency metrics, H2H, and situational splits.
+
+**Checkpoint:**
+
+    Stats pulled for both teams | ATS: [away] [W-L] / [home] [W-L]
+    H2H last 5: [W-L ATS] | O/U last 5: [O-U]
+    Key trend: [top finding]
+    Proceed? (yes / pull more / halt)
+
+---
+
+## Step 6 — Market Maker
+
+**Agent:** Market Maker
+**Depends on:** Steps 1-5 (all data-gathering steps)
+**Dispatch mode:** foreground
+
+**Purpose:** Build independent fair-value lines using all research inputs.
+
+**Dispatch prompt:**
+> Activate Market Maker. Build an independent fair-value line for
+> {away_team} vs {home_team}. Sport: {sport}. Inject these upstream
+> inputs: injury adjustments from Step 1: {injury_output}. Weather
+> impact from Step 2: {weather_output}. Rest differential from
+> Step 3: {situational_output}. Use power ratings and the situational
+> adjustments to produce: fair-value spread (home perspective),
+> fair-value total, no-vig moneylines, and implied win probability
+> for each side. Then compare against the current market line and
+> output edge % on spread, total, and moneyline. If fair spread
+> disagrees with market by <= 0.5 points, report "no edge."
+
+**Expected output:** Fair spread, total, MLs, win probs, and edge vs market.
+
+**Checkpoint:**
+
+    Fair spread: [home] [+/- X.X] | Market: [+/- X.X] | Diff: [+/- X.X pts]
+    Fair total: [X.X] | Market: [X.X] | Diff: [+/- X.X pts]
+    Edge: [+X.X%] on [side] or "no edge"
+    Proceed to synthesis? (yes / re-run with adjustments / halt)
+
+---
+
+## Step 7 — Synthesis (no agent dispatch)
+
+**Depends on:** All previous steps
+
+**Purpose:** Combine all agent outputs into the final research brief with confidence tier.
+
+**Action:** Apply the confidence framework below. Combine outputs from all steps into the Research Brief Output Template. Include: injury report, weather, situational angles, breaking news, key stats, line data, Market Maker model output, and final verdict with confidence tier and unit sizing.
+
+### Confidence Framework
 
 | Grade | Criteria | Unit Sizing |
 |-------|----------|-------------|
-| A | 3+ independent signals converging, edge ≥ 5%, no conflicting data | 1.5–2 units |
-| B | 2 strong signals, edge 3–5%, 1 minor conflict acceptable | 1 unit |
-| C | 1 clear signal, edge 3–4%, 1–2 concerns but not disqualifying | 0.5 units |
+| A | 3+ independent signals converging, edge >= 5%, no conflicting data | 1.5-2 units |
+| B | 2 strong signals, edge 3-5%, 1 minor conflict acceptable | 1 unit |
+| C | 1 clear signal, edge 3-4%, 1-2 concerns but not disqualifying | 0.5 units |
 | PASS | Edge < 3%, conflicting signals, key injury unresolved, or no thesis | 0 |
+
+**Checkpoint:**
+
+    Research brief complete for [away] at [home]
+    Confidence: [A/B/C/PASS] | Edge: [X.X%] | Side: [recommendation]
+    Units: [X.X] | CLV target: [X]
+    Accept brief? (yes / re-run [step] / halt)
 
 ---
 
@@ -237,24 +254,23 @@ PREGAME RESEARCH BRIEF
 ================================================================================
 Sport:        [NFL / NBA / MLB / NHL]
 Game:         [Away] @ [Home]
-Date/Time:    [Day, Month DD YYYY — HH:MM ET]
+Date/Time:    [Day, Month DD YYYY -- HH:MM ET]
 Generated:    [YYYY-MM-DD HH:MM:SS]
 Analyst:      pregame-researcher + [agents invoked]
 
 --- INJURY REPORT ---
 [AWAY TEAM]
   [Player] | [Pos] | [Status: OUT/DOUBTFUL/QUESTIONABLE/PROBABLE] | [Description]
-  [Player] | [Pos] | [Status] | [Description]
 
 [HOME TEAM]
   [Player] | [Pos] | [Status] | [Description]
 
-Injury Impact:  [CRITICAL / HIGH / MODERATE / NONE] — [1-line summary]
+Injury Impact:  [CRITICAL / HIGH / MODERATE / NONE] -- [1-line summary]
 Source:         [Official report + beat reporter, confirmed HH:MM ET]
 
 --- WEATHER (outdoor only) ---
 Venue:          [Stadium name, City]
-Temperature:    [XX°F]
+Temperature:    [XX F]
 Wind:           [XX mph, direction]
 Precipitation:  [XX% chance]
 O/U Impact:     [SEVERE / MODERATE / MINIMAL]
@@ -264,7 +280,7 @@ Notes:          [Any specific wind direction concern re: open end zone, etc.]
 Rest:
   [Away team]:  [X days rest | off bye | short week | B2B]
   [Home team]:  [X days rest | off bye | short week | B2B]
-  Rest Edge:    [Team] has [X]-day advantage — model adjustment: [+/- X.X pts]
+  Rest Edge:    [Team] has [X]-day advantage -- model adjustment: [+/- X.X pts]
 
 Schedule Spot:
   [ ] Short week
@@ -276,8 +292,7 @@ Schedule Spot:
   [ ] Desperation spot: [detail]
 
 --- BREAKING NEWS (The Insider) ---
-[Timestamp] [Team] [News item — relevance: HIGH/MEDIUM/LOW]
-[Timestamp] [Team] [News item — relevance: HIGH/MEDIUM/LOW]
+[Timestamp] [Team] [News item -- relevance: HIGH/MEDIUM/LOW]
 
 --- KEY STATS & TRENDS ---
 ATS Records:
@@ -290,18 +305,17 @@ O/U Records:
   [Away] last 10:         [O-U]
   [Home] last 10:         [O-U]
   H2H last 5:             [O-U]
-  In weather conditions:  [O-U in wind > 15mph / outdoor cold games]
 
 --- LINE DATA ---
 Opening:        [Home] [spread]  |  Total: [X]
 Current:        [Home] [spread]  |  Total: [X]
 Movement:       [+/- X pts on spread | +/- X on total]
-Sharp Signal:   [RLM / STEAM / NONE] — [description]
+Sharp Signal:   [RLM / STEAM / NONE] -- [description]
 Public:         [XX%] bets on [Team] | [XX%] money on [Team]
 
 --- MARKET MAKER MODEL ---
-Fair Spread:    [Home] [±X.X]   (market: [±X.X] | diff: [±X.X pts])
-Fair Total:     [X.X]           (market: [X.X] | diff: [±X.X pts])
+Fair Spread:    [Home] [+/- X.X]   (market: [+/- X.X] | diff: [+/- X.X pts])
+Fair Total:     [X.X]           (market: [X.X] | diff: [+/- X.X pts])
 Win Prob:       [Away] [XX%]  /  [Home] [XX%]
 Prob Edge:      [Team]: [+X.X%] edge vs. market implied prob
 
@@ -312,9 +326,9 @@ CLV Target:     Close at [X] or better vs. current [X]
 Unit Sizing:    [X.X] units / $[XX.XX]
 
 Rationale:
-  [Primary edge driver — 1 sentence]
-  [Supporting signal — 1 sentence]
-  [Key risk to thesis — 1 sentence]
+  [Primary edge driver -- 1 sentence]
+  [Supporting signal -- 1 sentence]
+  [Key risk to thesis -- 1 sentence]
 ================================================================================
 ```
 
@@ -331,10 +345,37 @@ Rationale:
 
 ---
 
-## Constraints
+## Intervention Commands
 
-- Do not issue a brief graded above C without data from at least Steps 1, 5, and 6.
-- Weather step is mandatory for all NFL outdoor games and all MLB games — no exceptions.
-- If The Insider reports a CRITICAL news item after the brief is issued, re-run the full pipeline. Do not patch a stale brief.
-- Stats Collector sample size minimum: 10 games for ATS/O-U trends. Do not cite trends with fewer samples.
-- If market-maker fair spread disagrees with current market by ≤ 0.5 points, there is no edge — do not force a bet.
+Available at any checkpoint:
+
+| Command | Effect |
+|---------|--------|
+| `yes` / Enter | Proceed to next step |
+| `halt` | Stop the pipeline |
+| `skip [step]` | Skip a step (e.g., skip weather for indoor game) |
+| `re-run [step]` | Re-run a specific step with fresh data |
+| `deep dive` | Run additional analysis on current step |
+
+---
+
+## Decision Rules
+
+- **No brief above C without Steps 1, 5, and 6.** Injury data, stats, and model output are mandatory.
+- **Weather mandatory for NFL outdoor and all MLB.** No exceptions.
+- **CRITICAL injury unresolved = confidence capped at C or PASS.** Do not issue an A or B brief with an unresolved franchise-player injury.
+- **0.5-point spread agreement = no edge.** If Market Maker and market agree within 0.5 points, there is no actionable edge.
+- **10-game sample minimum.** Do not cite ATS/O-U trends with fewer than 10 games.
+- **Re-run on CRITICAL news.** If The Insider reports a HIGH-relevance item after the brief is issued, re-run the full pipeline.
+- **Steps 1-5 run in parallel.** They are independent data-gathering steps with no dependencies on each other. Step 6 depends on all of them.
+
+---
+
+## Constraints & Disclaimers
+
+This system is for **educational and research purposes only**. Output is based on mathematical models and historical data. It is not a guarantee of profit and should not be construed as financial or gambling advice.
+
+- Sports betting involves substantial risk of loss.
+- No model eliminates variance.
+- Bet only what you can afford to lose entirely.
+- **Problem gambling resources:** 1-800-522-4700 | ncpgambling.org
