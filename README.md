@@ -124,6 +124,10 @@ For quick entries from the terminal without opening Claude Code.
 
 # Full dashboard: balance, P&L, agent performance, equity curve
 ./scripts/bankroll-status.sh
+
+# Web dashboard (local)
+python site/serve.py
+# Open http://localhost:8501
 ```
 
 ### Betslip Lifecycle
@@ -173,6 +177,23 @@ Or from the terminal:
 ```bash
 ./scripts/bankroll-status.sh
 ```
+
+## Dashboard
+
+A local web dashboard for viewing your bankroll, bet history, and agent performance.
+
+```bash
+python site/serve.py
+```
+
+Open **http://localhost:8501**. The dashboard shows:
+
+- **Bankroll summary** — balance, P&L, drawdown, risk tolerance
+- **Bet history** — full ledger with result badges, odds, stakes, and P&L
+- **Equity curve** — balance over time (from daily snapshots)
+- **Agent performance** — per-agent, per-sport ROI and CLV tracking
+
+No dependencies beyond Python 3 and your `~/.syndicate/bankroll.db`. Dark theme, mobile responsive.
 
 ## Workflows
 
