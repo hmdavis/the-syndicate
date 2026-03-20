@@ -289,7 +289,7 @@ After presenting the betslip, ask the user: *"Record these picks to your bankrol
 If yes:
 
 **Dispatch prompt:**
-> Activate State Manager. Record the following bets to ~/.syndicate/bankroll.db. For each bet, insert into the bets table with: sport = {sport}, game = {matchup}, side = {side}, odds = {best_odds_american}, stake = {dollar_amount}, agent_used = "Sharp Orchestrator (pipeline: Odds Scraper -> Pregame Researcher -> Market Maker -> Elo Modeler -> Line Shopper -> Kelly Criterion)". Set status to "open". Do not modify bankroll_state until the bets settle.
+> Activate State Manager. Record the following bets to ~/.syndicate/bankroll.db. For each bet, insert into the bets table with: sport = {sport}, game = {matchup}, market = {market_type} (e.g., "spread", "moneyline", "total"), selection = {selection} (e.g., "Penn +25.5", "BYU ML"), odds = {best_odds_american}, stake = {dollar_amount}, agent_used = "Sharp Orchestrator (pipeline: Odds Scraper -> Pregame Researcher -> Market Maker -> Elo Modeler -> Line Shopper -> Kelly Criterion)", result = 'PENDING'. Do not modify bankroll_state until bets settle.
 
 **Expected output:** Confirmation of recorded bets with bet IDs.
 
