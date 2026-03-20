@@ -394,8 +394,19 @@ After both agents return, compare their spreads. If they disagree by more than 2
 - Units, dollar stake
 - 2-3 sentence thesis drawing from pregame research (Step 3)
 - Pipeline confidence note: reference `{performance_context}` — if the pipeline is VALIDATED for this sport, note it. If any agent is UNDERPERFORMING, flag which one and how sizing was adjusted.
+- Signals dict assembled from pipeline outputs:
+  - `model_edge_pct`: from Market Maker's edge calculation
+  - `fair_value`: from Market Maker's fair line
+  - `model_conflict`: true if Market Maker and Elo disagree > 2 pts
+  - `conflict_pts`: absolute difference between Market Maker and Elo spreads
+  - `best_available_line`: from Line Shopper (line + book name)
+  - `books_pricing`: number of books with odds for this game
+  - `thin_market`: true if books_pricing < 3
+  - `kelly_fraction`: from Kelly Criterion Manager (0.0–1.0)
+  - `human_override`: true if user forced/dropped this pick at checkpoint (default false)
+- Any signal-driven adjustments applied (e.g., "DROPPED due to model_conflict + edge < 5%")
 
-For passed games, show why (edge < 3%, thin market, model conflict, stale odds).
+For passed games, show why (edge < 3%, thin market, model conflict, stale odds, **signal adjustment**).
 
 End with:
 - Performance summary (pipeline ROI for this sport, CLV trend, any flags)
@@ -418,14 +429,29 @@ If yes:
 
 **Dispatch prompt:**
 > Activate State Manager. Record the following bets to
-> ~/.syndicate/bankroll.db. For each bet, insert into the bets table
-> with: sport = {sport}, game = {matchup}, market = {market_type}
+> ~/.syndicate/bankroll.db. For each bet, call record_bet() with:
+> sport = {sport}, game = {matchup}, market = {market_type}
 > (e.g., "spread", "moneyline", "total"), selection = {selection}
 > (e.g., "Penn +25.5", "BYU ML"), odds = {best_odds_american},
 > stake = {dollar_amount}, agent_used = "Sharp Orchestrator
 > (pipeline: Odds Scraper -> Pregame Researcher -> Market Maker ->
 > Elo Modeler -> Line Shopper -> Kelly Criterion)", result =
-> 'PENDING'. Do not modify bankroll_state until bets settle.
+> 'PENDING', signals = {signals_dict}.
+>
+> The signals dict for each pick:
+> {
+>   "model_edge_pct": {edge_pct},
+>   "fair_value": "{fair_line}",
+>   "model_conflict": {model_conflict},
+>   "conflict_pts": {conflict_pts},
+>   "best_available_line": "{best_line} @ {best_book}",
+>   "books_pricing": {num_books},
+>   "kelly_fraction": {kelly_fraction},
+>   "thin_market": {thin_market},
+>   "human_override": {human_override}
+> }
+>
+> Do not modify bankroll_state until bets settle.
 
 **Checkpoint:**
 
