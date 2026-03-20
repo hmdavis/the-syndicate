@@ -89,13 +89,35 @@ print(performance_report(days=30))
 
 ## Environment Variables
 
-Agents that call external APIs need keys set in the environment. See `.env.example` for the full list.
+Agents that call external APIs need keys set in the environment.
+
+### Configuring API Keys for Claude Code
+
+The recommended way to set API keys is via `.claude/settings.local.json` (gitignored, never committed):
+
+```json
+{
+  "env": {
+    "ODDS_API_KEY": "your_key_here"
+  }
+}
+```
+
+This makes the key available to Claude Code and all dispatched subagents. Keys set in `.zshrc` or `.bashrc` are **not** inherited by subagents — use `settings.local.json` instead.
+
+Alternatively, see `.env.example` for the full list of keys (used by standalone CLI scripts).
+
+### Required Keys
 
 **Required:** `ODDS_API_KEY` (from the-odds-api.com, free tier available)
 
-**Optional:** `CFBD_API_KEY`, `SPORTRADAR_API_KEY`, `ODDSJAM_API_KEY`, `SLACK_WEBHOOK_URL`, `PUSHOVER_USER_KEY`, `DISCORD_WEBHOOK_URL`
+### Optional Keys
 
-**No key needed:** nba_api, nfl_data_py, pybaseball, Open-Meteo weather, ESPN injury API, Polymarket CLOB reads
+`CFBD_API_KEY`, `SPORTRADAR_API_KEY`, `ODDSJAM_API_KEY`, `SLACK_WEBHOOK_URL`, `PUSHOVER_USER_KEY`, `DISCORD_WEBHOOK_URL`
+
+### No Key Needed
+
+nba_api, nfl_data_py, pybaseball, Open-Meteo weather, ESPN injury API, Polymarket CLOB reads
 
 ## Execution Environments
 
