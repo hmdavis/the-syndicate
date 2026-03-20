@@ -43,7 +43,7 @@ pip install httpx python-dotenv rich pandas sqlite3
 ### Environment Variables
 ```bash
 # .env
-THE_ODDS_API_KEY=your_key_here
+ODDS_API_KEY=your_key_here
 ODDSJAM_API_KEY=your_key_here    # optional
 CACHE_TTL_SECONDS=300            # 5-minute cache
 ```
@@ -80,7 +80,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_URL   = "https://api.the-odds-api.com/v4"
-API_KEY    = os.getenv("THE_ODDS_API_KEY", "")
+API_KEY    = os.getenv("ODDS_API_KEY", "")
 CACHE_TTL  = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 DB_PATH    = "data/odds_history.db"
 
@@ -395,7 +395,7 @@ def load_prior(sport: str, limit: int = 100) -> list[dict]:
 
 def scrape(sport: str, output_path: str, markets: str = "h2h,spreads,totals") -> None:
     if not API_KEY:
-        raise EnvironmentError("THE_ODDS_API_KEY not set. Get a free key at the-odds-api.com")
+        raise EnvironmentError("ODDS_API_KEY not set. Get a free key at the-odds-api.com")
 
     sport_key = SPORT_KEYS.get(sport.lower())
     if not sport_key:
@@ -632,7 +632,7 @@ if __name__ == "__main__":
 
 ## Decision Rules
 
-- **API key required.** Never run without `THE_ODDS_API_KEY`. Raise immediately if missing.
+- **API key required.** Never run without `ODDS_API_KEY`. Raise immediately if missing.
 - **Cache aggressively.** Cache for 5 minutes minimum. Never make duplicate API calls within the TTL window.
 - **Quota guard.** If requests remaining < 20, switch to cache-only mode and alert the operator.
 - **Staleness check.** Flag any game odds older than 2 hours from commence time as "STALE" and exclude from best-line calculations.
@@ -665,4 +665,4 @@ Usage of The Odds API is subject to their Terms of Service. Do not exceed rate l
 - Steam moves get `*** STEAM` markers — never bury them
 - Best lines always shown with book attribution: `DraftKings: +122`
 - Output JSON is always pretty-printed for readability downstream
-- Errors are loud and specific: `[ERROR] THE_ODDS_API_KEY not set` not silent failures
+- Errors are loud and specific: `[ERROR] ODDS_API_KEY not set` not silent failures
