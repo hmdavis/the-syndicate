@@ -138,13 +138,15 @@ CREATE TABLE IF NOT EXISTS bets (
     settled_at      TEXT,
     agent_used      TEXT,                      -- which Syndicate agent recommended this
     confidence      REAL    CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
-    notes           TEXT
+    notes           TEXT,
+    signals         JSON                       -- structured decision-point signals (pipeline bets only)
 );
 
 CREATE INDEX IF NOT EXISTS idx_bets_sport       ON bets(sport);
 CREATE INDEX IF NOT EXISTS idx_bets_result      ON bets(result);
 CREATE INDEX IF NOT EXISTS idx_bets_placed_at   ON bets(placed_at);
 CREATE INDEX IF NOT EXISTS idx_bets_agent_used  ON bets(agent_used);
+CREATE INDEX IF NOT EXISTS idx_bets_has_signals ON bets(sport) WHERE signals IS NOT NULL;
 
 -- ── daily_snapshots ────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS daily_snapshots (
@@ -167,6 +169,43 @@ CREATE TABLE IF NOT EXISTS agent_performance (
     avg_clv     REAL,
     last_used   TEXT,
     PRIMARY KEY (agent_name, sport)
+);
+
+-- ── bet_signals_v (extracted view for signal queries) ────
+DROP VIEW IF EXISTS bet_signals_v;
+CREATE VIEW bet_signals_v AS
+SELECT
+    b.id              AS bet_id,
+    b.sport,
+    b.agent_used,
+    b.result,
+    b.pnl,
+    b.stake,
+    b.clv,
+    b.placed_at,
+    json_extract(b.signals, '$.model_edge_pct')       AS model_edge_pct,
+    json_extract(b.signals, '$.fair_value')            AS fair_value,
+    json_extract(b.signals, '$.model_conflict')        AS model_conflict,
+    json_extract(b.signals, '$.conflict_pts')          AS conflict_pts,
+    json_extract(b.signals, '$.best_available_line')   AS best_available_line,
+    json_extract(b.signals, '$.books_pricing')         AS books_pricing,
+    json_extract(b.signals, '$.kelly_fraction')        AS kelly_fraction,
+    json_extract(b.signals, '$.thin_market')           AS thin_market,
+    json_extract(b.signals, '$.human_override')        AS human_override
+FROM bets b
+WHERE b.signals IS NOT NULL;
+
+-- ── signal_performance (cached signal-level stats) ───────
+CREATE TABLE IF NOT EXISTS signal_performance (
+    signal_name     TEXT    NOT NULL,
+    signal_bucket   TEXT    NOT NULL,
+    sport           TEXT    NOT NULL,
+    total_bets      INTEGER NOT NULL DEFAULT 0,
+    win_rate        REAL    NOT NULL DEFAULT 0,
+    roi_pct         REAL    NOT NULL DEFAULT 0,
+    avg_clv         REAL,
+    last_updated    TEXT,
+    PRIMARY KEY (signal_name, signal_bucket, sport)
 );
 
 -- ── sports_config ──────────────────────────────────────────
