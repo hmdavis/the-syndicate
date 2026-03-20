@@ -21,7 +21,7 @@ The orchestrator reads this workflow and executes each step.
 | Step | Agent | Role |
 |------|-------|------|
 | 1 | State Manager | Bankroll gate check |
-| 1.5 | (orchestrator) | Game list lookup |
+| 1.5 | (orchestrator) | Performance feedback + game list lookup |
 | 2 | Odds Scraper | Pull live lines |
 | 3 | Pregame Researcher | Per-game research briefs |
 | 4a | Market Maker | Independent fair values |
@@ -64,26 +64,119 @@ The orchestrator reads this workflow and executes each step.
 
 ---
 
-## Step 1.5 — Game List Lookup (no agent dispatch)
+## Step 1.5 — Performance Feedback + Game List Lookup (no agent dispatch)
 
 **Depends on:** Step 1 CLEAR
 
-**Purpose:** Fetch the day's game list so Steps 2 and 3 can run in parallel.
+**Purpose:** Query historical performance to calibrate downstream agents, then fetch the day's game list.
 
-The orchestrator queries The Odds API directly for {sport} on {date} to get matchups and commence times. Only the game list is needed — full odds come in Step 2.
+This step closes the learning feedback loop. The orchestrator queries `~/.syndicate/bankroll.db` for the track record of each agent that will be dispatched in this pipeline, scoped to `{sport}`. The output is a `{performance_context}` block injected into the dispatch prompts of Steps 4, 5, and 6 so agents can self-calibrate.
 
-**Action:**
+### Part A: Performance Feedback
+
+**Action:** Run the following queries against `~/.syndicate/bankroll.db`:
+
+    -- 1. Agent+sport performance (last 30/60/90 days)
+    SELECT
+        agent_used,
+        COUNT(*) as bets,
+        SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
+        SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) as losses,
+        ROUND(100.0 * SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN result IN ('WIN','LOSS') THEN 1 ELSE 0 END), 0), 1) as win_rate,
+        ROUND(100.0 * SUM(COALESCE(pnl, 0))
+              / NULLIF(SUM(CASE WHEN result IN ('WIN','LOSS','PUSH') THEN stake ELSE 0 END), 0), 1) as roi_pct,
+        ROUND(AVG(COALESCE(clv, 0)), 2) as avg_clv
+    FROM bets
+    WHERE sport LIKE '%{sport_pattern}%'
+      AND result IN ('WIN','LOSS','PUSH')
+      AND placed_at >= datetime('now', '-30 days')
+    GROUP BY agent_used;
+
+    -- 2. Recent bet outcomes for pattern detection
+    SELECT game, market, selection, odds, stake, result, pnl, clv
+    FROM bets
+    WHERE sport LIKE '%{sport_pattern}%'
+      AND result IN ('WIN','LOSS','PUSH')
+    ORDER BY settled_at DESC
+    LIMIT 20;
+
+    -- 3. Market type breakdown (are spreads working better than MLs?)
+    SELECT
+        market,
+        COUNT(*) as bets,
+        ROUND(100.0 * SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END)
+              / NULLIF(SUM(CASE WHEN result IN ('WIN','LOSS') THEN 1 ELSE 0 END), 0), 1) as win_rate,
+        ROUND(100.0 * SUM(COALESCE(pnl, 0))
+              / NULLIF(SUM(CASE WHEN result IN ('WIN','LOSS','PUSH') THEN stake ELSE 0 END), 0), 1) as roi_pct
+    FROM bets
+    WHERE sport LIKE '%{sport_pattern}%'
+      AND result IN ('WIN','LOSS','PUSH')
+    GROUP BY market;
+
+**Output:** `{performance_context}` — structured as follows:
+
+```
+PERFORMANCE FEEDBACK — {sport} (last 30 days)
+================================================
+Pipeline ROI: [X.X%] | Record: [W-L-P] | CLV: [+/-X.Xc avg]
+
+AGENT TRACK RECORD:
+  Market Maker: [N] bets | [X.X%] ROI | CLV [+/-X.X]c | STATUS: [VALIDATED/NEUTRAL/UNDERPERFORMING]
+  Elo Modeler:  [N] bets | [X.X%] ROI | CLV [+/-X.X]c | STATUS: [VALIDATED/NEUTRAL/UNDERPERFORMING]
+  Kelly:        [N] bets | [X.X%] ROI | STATUS: [VALIDATED/NEUTRAL/UNDERPERFORMING]
+
+MARKET TYPE BREAKDOWN:
+  Spreads: [W-L] ([X.X%] ROI)
+  Moneylines: [W-L] ([X.X%] ROI)
+  Totals: [W-L] ([X.X%] ROI)
+
+CALIBRATION SIGNALS:
+  [List of specific observations, e.g.:]
+  - Market Maker has been 2.1 pts off on avg in NCAAB spreads — widen confidence intervals
+  - Positive CLV (+1.4c) sustained over 30+ bets — genuine edge signal, maintain approach
+  - Spread bets outperforming MLs by 8% ROI — favor spread markets today
+  - Kelly sizing has been conservative — actual drawdown 3% vs 20% limit
+
+UNDERPERFORMER FLAGS:
+  [Any agent+sport with negative ROI over 20+ bets]
+  - [agent]: -X.X% ROI over N bets — increase skepticism, require stronger edge to act
+
+(If < 10 settled bets exist for this sport, output: "INSUFFICIENT HISTORY — no calibration available, using default parameters.")
+```
+
+**Status thresholds:**
+- VALIDATED: positive CLV over 30+ bets (genuine edge signal)
+- NEUTRAL: < 30 bets, or CLV near zero (insufficient data to judge)
+- UNDERPERFORMING: negative ROI over 20+ bets, or negative CLV over 30+ bets
+
+### Part B: Game List Lookup
+
+**Action:** Query The Odds API for {sport} on {date} to get game matchups and commence times. Filter out any game where commence_time < current time (already started).
 
     curl -s "https://api.the-odds-api.com/v4/sports/{sport}/odds?apiKey=$ODDS_API_KEY&regions=us&dateFormat=iso" \
-      | python3 -c "import sys,json; games=json.load(sys.stdin); [print(f\"{g['away_team']} vs {g['home_team']} | {g['commence_time']}\") for g in games]"
+      | python3 -c "
+    import sys,json
+    from datetime import datetime,timezone
+    now=datetime.now(timezone.utc)
+    games=json.load(sys.stdin)
+    upcoming=[g for g in games if datetime.fromisoformat(g['commence_time'].replace('Z','+00:00'))>now]
+    for g in upcoming:
+        print(f\"{g['away_team']} vs {g['home_team']} | {g['commence_time']}\")
+    print(f'Filtered: {len(games)-len(upcoming)} games already started')
+    "
 
-**Output:** `{game_list}` — list of matchups with tip times.
+**Output:** `{game_list}` — list of upcoming matchups with tip times (games already started are excluded).
 
 **Checkpoint:**
 
-    Found N games for {sport} on {date}:
+    PERFORMANCE FEEDBACK:
+    Pipeline ROI: [X.X%] | Record: [W-L-P] | [N] bets settled
+    Flags: [underperformer flags or "none"]
+    ---
+    Found N upcoming games for {sport} on {date} (N already started, excluded):
     - Away vs Home | tip time
-    Proceed? (yes / drop [game])
+    Proceed? (yes / drop [game] / review feedback)
 
 ---
 
@@ -152,17 +245,32 @@ The orchestrator queries The Odds API directly for {sport} on {date} to get matc
 **Dispatch prompt (Market Maker):**
 > Activate Market Maker. Build independent fair-value lines for these
 > games. Here is the pregame research for situational adjustments:
-> {pregame_output}. For each game, output: fair-value spread,
-> fair-value total, no-vig moneylines, implied win probabilities. Do
-> NOT look at the market lines until after you've formed your own
-> number from power ratings and situational factors. Then compare your
-> fair values against the market odds: {odds_output}. Output edge
-> percentage vs the market consensus line for each game.
+> {pregame_output}.
+>
+> Before building your numbers, review your recent track record for
+> this sport: {performance_context}. If your status is
+> UNDERPERFORMING, widen your confidence intervals and require a
+> larger edge before recommending action. If VALIDATED, maintain your
+> current approach. Pay attention to any calibration signals — e.g.,
+> if you've been systematically off by N points, adjust accordingly.
+>
+> For each game, output: fair-value spread, fair-value total, no-vig
+> moneylines, implied win probabilities. Do NOT look at the market
+> lines until after you've formed your own number from power ratings
+> and situational factors. Then compare your fair values against the
+> market odds: {odds_output}. Output edge percentage vs the market
+> consensus line for each game.
 
 **Dispatch prompt (Elo Modeler):**
 > Activate Elo Modeler. Generate Elo-based power ratings and game
-> predictions for these matchups: {game_list}. Sport: {sport}. Output:
-> Elo rating for each team, predicted spread, and implied win
+> predictions for these matchups: {game_list}. Sport: {sport}.
+>
+> Review your recent track record: {performance_context}. If your
+> spreads have been systematically off in one direction, consider
+> adjusting your K-factor or home-court advantage parameter. If
+> VALIDATED, maintain current settings.
+>
+> Output: Elo rating for each team, predicted spread, and implied win
 > probability per game.
 
 **Cross-reference (orchestrator):**
@@ -218,10 +326,21 @@ After both agents return, compare their spreads. If they disagree by more than 2
 > (1/4). Bankroll: {bankroll_balance}. For each pick, here are the
 > inputs — let Kelly compute the edge internally from these: win
 > probability is {win_prob} (from Market Maker), best available
-> American odds are {best_odds_american} (from Line Shopper). Apply
-> drawdown protection rules. Enforce 3-unit max per bet and 10-unit
-> portfolio cap. Output: game, side, computed edge %, Kelly fraction,
-> units, dollar amount, and total portfolio exposure.
+> American odds are {best_odds_american} (from Line Shopper).
+>
+> Review the performance feedback: {performance_context}. Adjust
+> sizing based on track record: if the pipeline is VALIDATED for this
+> sport (positive CLV over 30+ bets), you may size up to full
+> quarter-Kelly. If NEUTRAL (insufficient history), use 1/5 Kelly
+> instead for conservatism. If any upstream agent is UNDERPERFORMING,
+> reduce sizing by 25% on picks generated by that agent. If the
+> market type breakdown shows one market (spreads/MLs/totals)
+> significantly outperforming others, note this but do not override
+> the Market Maker's recommendation.
+>
+> Apply drawdown protection rules. Enforce 3-unit max per bet and
+> 10-unit portfolio cap. Output: game, side, computed edge %, Kelly
+> fraction, units, dollar amount, and total portfolio exposure.
 
 **Expected output:** Sized picks with units, dollars, and total exposure.
 
@@ -246,10 +365,12 @@ After both agents return, compare their spreads. If they disagree by more than 2
 - Fair value, edge %, model agreement (Market Maker vs Elo)
 - Units, dollar stake
 - 2-3 sentence thesis drawing from pregame research (Step 3)
+- Pipeline confidence note: reference `{performance_context}` — if the pipeline is VALIDATED for this sport, note it. If any agent is UNDERPERFORMING, flag which one and how sizing was adjusted.
 
 For passed games, show why (edge < 3%, thin market, model conflict, stale odds).
 
 End with:
+- Performance summary (pipeline ROI for this sport, CLV trend, any flags)
 - Exposure summary (total units, total dollars, % of bankroll)
 - Responsible gambling disclaimer
 
@@ -306,11 +427,15 @@ Available at any checkpoint:
 - **No partial pipelines.** Steps 1-6 must complete before betslip generation.
 - **3% edge floor.** Games below this threshold are passed, not sized.
 - **90-minute stale gate.** Odds older than 90 min from game time are excluded.
+- **Already-started gate.** Games with commence_time < current time are excluded at Step 1.5.
 - **Thin market.** < 3 books pricing a game = sizing reduced 50%.
 - **Model conflict.** Market Maker and Elo disagree by > 2 pts = confidence downgraded one tier.
 - **10-unit portfolio cap.** Total exposure cannot exceed 10 units across all picks.
 - **3-unit single bet cap.** No individual pick exceeds 3 units.
 - **20% drawdown halt.** Pipeline stops. No new picks until drawdown recovers to < 15%.
+- **Feedback-driven sizing.** VALIDATED agents (positive CLV, 30+ bets) get full quarter-Kelly. NEUTRAL agents (< 30 bets) get 1/5 Kelly. UNDERPERFORMING agents get 25% sizing reduction.
+- **Calibration override.** If performance feedback shows a systematic bias (e.g., Market Maker consistently 2+ pts off), agents must acknowledge and adjust before producing output.
+- **Insufficient history.** If < 10 settled bets exist for this sport, skip performance calibration and use default parameters. Note "no history" in the betslip.
 
 ---
 

@@ -49,7 +49,8 @@ Two categories of placeholders:
 - `{date}` — slate date (e.g., `2026-03-19`)
 
 **Inter-step data** (substituted with actual agent output):
-- `{game_list}` — from Step 1.5
+- `{performance_context}` — from Step 1.5 Part A (historical track record for this sport, agent statuses, calibration signals)
+- `{game_list}` — from Step 1.5 Part B (upcoming games only, already-started excluded)
 - `{bankroll_balance}` — from Step 1
 - `{odds_output}` — from Step 2
 - `{pregame_output}` — from Step 3
