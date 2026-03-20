@@ -476,9 +476,9 @@ def performance_report(days: int = 30) -> str:
         HAVING bets >= 3
         ORDER BY total_pnl DESC
     """, conn)
-    conn.close()
 
     if df.empty:
+        conn.close()
         return f"Not enough data for a {days}-day feedback report (need ≥3 settled bets per agent/sport)."
 
     df["roi_pct"] = (df["total_pnl"] / df["wagered"].replace(0, pd.NA) * 100).round(2)
@@ -531,6 +531,36 @@ def performance_report(days: int = 30) -> str:
     lines.append(tabulate(table_df, headers="keys", tablefmt="simple",
                            floatfmt=".2f", showindex=False, numalign="right"))
     lines.append("")
+
+    # ── Signal Insights ──
+    signal_df = pd.read_sql_query("""
+        SELECT signal_name, signal_bucket, total_bets, win_rate, roi_pct, avg_clv
+        FROM signal_performance
+        WHERE sport IN ({sports})
+          AND total_bets >= 10
+        ORDER BY signal_name, roi_pct DESC
+    """.format(sports=",".join(f"'{s}'" for s in df["sport"].unique())), conn)
+
+    if not signal_df.empty:
+        lines.append("")
+        lines.append("  SIGNAL INSIGHTS (min 10 bets per bucket):")
+        lines.append("  " + "-" * 54)
+
+        for signal_name, group in signal_df.groupby("signal_name"):
+            display_name = signal_name.upper().replace("_", " ")
+            lines.append(f"  {display_name}:")
+            for _, srow in group.iterrows():
+                status = "VALIDATED" if srow["roi_pct"] > 0 and (srow["avg_clv"] or 0) > 0 else \
+                         "UNDERPERFORMING" if srow["roi_pct"] < 0 else "MARGINAL"
+                clv_str = f" | {srow['avg_clv']:+.1f}c CLV" if srow["avg_clv"] is not None else ""
+                lines.append(
+                    f"    {srow['signal_bucket']}: {int(srow['total_bets'])} bets | "
+                    f"{srow['roi_pct']:+.1f}% ROI{clv_str} -> {status}"
+                )
+            lines.append("")
+
+    conn.close()
+
     lines.append(f"  Balance: ${state['current_balance']:.2f} "
                  f"(started ${state['starting_balance']:.2f}) | "
                  f"Risk: {state['risk_tolerance']}")
