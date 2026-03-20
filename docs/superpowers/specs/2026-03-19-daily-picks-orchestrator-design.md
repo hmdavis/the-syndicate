@@ -51,8 +51,8 @@ Step 1: State Manager          Step 2: Odds Scraper
         |   angles, trends             |
         |         |                    |
         v         v                    v
-      Step 4: Market Maker
-      (independent fair values)
+      Step 4: Market Maker + Elo Modeler
+      (independent fair values, cross-referenced)
                 |
                 v
         fair-value spreads,
@@ -77,19 +77,26 @@ Step 1: State Manager          Step 2: Odds Scraper
                 v
       Step 7: Sharp Orchestrator
       (synthesize betslip)
+                |
+                v
+      Step 8: State Manager
+      (record bets, optional)
 ```
 
 ### Parallelism
 
-- Steps 2 and 3 run in parallel (no dependency on each other)
+- Steps 2 and 3 run in parallel — Step 2 (Odds Scraper) produces the game list, Step 3 (Pregame Researcher) uses it. To resolve this dependency while preserving parallelism: the orchestrator itself fetches the game list from The Odds API as a lightweight lookup between Steps 1 and 2/3 (just game names + tip times, not full odds). Both Steps 2 and 3 then receive the game list as input and run concurrently.
 - Step 3 dispatches one Pregame Researcher subagent per game (parallel)
+- Step 4 dispatches both Market Maker and Elo Modeler in parallel, then cross-references their outputs
 - All other steps are sequential
 
 ### Gates
 
-- Step 1: If drawdown > 20%, pipeline halts
+- Step 1: If drawdown > 20%, pipeline halts. No new picks until drawdown recovers to < 15%.
 - Step 4: Games with edge < 3% are marked PASS and excluded from Steps 5-7
-- Step 5: Games with < 3 books pricing them are flagged "thin market" and sizing is reduced 50%
+- Step 4: If Market Maker and Elo Modeler disagree by > 2 points on a spread, flag as "model conflict" and downgrade confidence one tier
+- Step 5: Games with < 3 books pricing them are flagged "thin market" — this flag originates in Step 2 and propagates through to Step 6 where sizing is reduced 50%
+- Step 7: If odds timestamp is > 90 minutes old relative to game time, flag as "stale" and exclude from betslip
 
 ---
 
@@ -116,6 +123,27 @@ Each step in `workflows/daily-picks.md` follows this structure:
 
 ---
 
+## Placeholder Convention
+
+Placeholders in dispatch prompts use `{curly_braces}`. Two categories:
+
+**User-provided inputs** (set once at pipeline start):
+- `{sport}` — sport key (e.g., `basketball_ncaab`)
+- `{date}` — game date (e.g., `2026-03-19`)
+
+**Inter-step data flow** (substituted with actual agent output at runtime):
+- `{game_list}` — game names + tip times from pre-Step-2 lookup
+- `{bankroll_balance}` — from Step 1
+- `{odds_output}` — full output from Step 2
+- `{pregame_output}` — combined output from Step 3 (all games)
+- `{fair_values_output}` — from Step 4 (Market Maker + Elo Modeler)
+- `{line_shop_output}` — from Step 5
+- `{win_prob}`, `{best_odds_american}` — per-pick values extracted from Steps 4+5
+
+The orchestrator passes **full text output** between steps (not summaries) to preserve context for downstream agents.
+
+---
+
 ## Dispatch Prompts
 
 ### Step 1 — State Manager (gate)
@@ -125,26 +153,36 @@ Each step in `workflows/daily-picks.md` follows this structure:
 **Dispatch mode:** foreground
 
 **Dispatch prompt:**
-> Activate State Manager. Read the current bankroll state from ~/.syndicate/bankroll.db. Report: current balance, starting balance, P&L, drawdown percentage, and whether any sport-specific exposure limits apply for {sport}. If drawdown exceeds 20%, output HALT with the reason. Otherwise output CLEAR with the bankroll summary.
+> Activate State Manager. Read the current bankroll state from ~/.syndicate/bankroll.db. The bankroll_state table has columns: current_balance, starting_balance, risk_tolerance, created_at, updated_at. Compute P&L as (current_balance - starting_balance). Compute drawdown percentage as ((starting_balance - current_balance) / starting_balance * 100) — if current_balance > starting_balance, drawdown is 0%. Check sports_config to confirm {sport} is enabled. Report: current balance, starting balance, computed P&L, computed drawdown %, risk tolerance, and sport status. If drawdown exceeds 20%, output HALT with the reason. No new picks until drawdown recovers to < 15%. Otherwise output CLEAR with the bankroll summary.
 
-**Expected output:** Bankroll balance, drawdown %, CLEAR/HALT status, sport config.
+**Expected output:** Bankroll balance, computed P&L, computed drawdown %, CLEAR/HALT status, sport config.
 
 **Checkpoint:**
-> Bankroll: $X | Drawdown: X% | Status: CLEAR/HALT | Sport: {sport} enabled
+> Bankroll: $X | P&L: $X | Drawdown: X% | Status: CLEAR/HALT | Sport: {sport} enabled
 > *Proceed? (yes / halt)*
+
+---
+
+### Step 1.5 — Game List Lookup (orchestrator, no agent dispatch)
+
+The orchestrator fetches the day's game list as a lightweight lookup before dispatching Steps 2 and 3. This resolves the dependency: both Odds Scraper and Pregame Researcher need the game list, but they run in parallel.
+
+**Action:** Query The Odds API for {sport} on {date} to get game matchups and commence times. Use `ODDS_API_KEY` environment variable. Only the game list is needed here — full odds are pulled in Step 2.
+
+**Output:** `{game_list}` — list of matchups with tip times, passed to Steps 2 and 3.
 
 ---
 
 ### Step 2 — Odds Scraper (parallel with Step 3)
 
 **Agent:** Odds Scraper
-**Depends on:** Step 1 CLEAR
+**Depends on:** Step 1 CLEAR + game list from Step 1.5
 **Dispatch mode:** background (parallel with Step 3)
 
 **Dispatch prompt:**
-> Activate Odds Scraper. Pull current odds for {sport} games on {date} from The Odds API. Use the ODDS_API_KEY environment variable. Markets: h2h, spreads, totals. Region: us. Return a structured table per game showing: matchup, spread (home perspective), total, and moneyline for each available book. Flag any games with fewer than 3 books pricing them as "thin market."
+> Activate Odds Scraper. Pull current odds for these {sport} games on {date}: {game_list}. Use the `ODDS_API_KEY` environment variable (as defined in CLAUDE.md and .env.example). Markets: h2h, spreads, totals. Region: us. Return a structured table per game showing: matchup, spread (home perspective), total, and moneyline for each available book. Include the odds timestamp for each game. Flag any games with fewer than 3 books pricing them as "thin market" — this flag will propagate to downstream sizing.
 
-**Expected output:** Structured odds data per game per book. Thin market flags. API quota remaining.
+**Expected output:** Structured odds data per game per book with timestamps. Thin market flags. API quota remaining.
 
 **Checkpoint:**
 > Pulled odds for N games across N books | Thin markets: N | API calls remaining: N
@@ -156,7 +194,7 @@ Each step in `workflows/daily-picks.md` follows this structure:
 ### Step 3 — Pregame Researcher (parallel with Step 2, one per game)
 
 **Agent:** Pregame Researcher
-**Depends on:** Step 1 CLEAR
+**Depends on:** Step 1 CLEAR + game list from Step 1.5
 **Dispatch mode:** background (parallel with Step 2; one subagent per game)
 
 **Dispatch prompt (per game):**
@@ -171,20 +209,26 @@ Each step in `workflows/daily-picks.md` follows this structure:
 
 ---
 
-### Step 4 — Market Maker
+### Step 4 — Market Maker + Elo Modeler (parallel, then cross-reference)
 
-**Agent:** Market Maker
+**Agents:** Market Maker, Elo Modeler
 **Depends on:** Steps 2 + 3
-**Dispatch mode:** foreground
+**Dispatch mode:** foreground (both dispatched in parallel, then orchestrator cross-references)
 
-**Dispatch prompt:**
-> Activate Market Maker. Build independent fair-value lines for these games. Here are the current market odds: {odds_output}. Here is the pregame research for situational adjustments: {pregame_output}. For each game, output: fair-value spread, fair-value total, no-vig moneylines, implied win probabilities, and edge percentage vs the market consensus line. Do NOT look at the market lines until after you've formed your own number from power ratings and situational factors.
+**Dispatch prompt (Market Maker):**
+> Activate Market Maker. Build independent fair-value lines for these games. Here is the pregame research for situational adjustments: {pregame_output}. For each game, output: fair-value spread, fair-value total, no-vig moneylines, implied win probabilities. Do NOT look at the market lines until after you've formed your own number from power ratings and situational factors. Then compare your fair values against the market odds: {odds_output}. Output edge percentage vs the market consensus line for each game.
 
-**Expected output:** Per-game fair-value spread, total, MLs, win probs, edge %.
+**Dispatch prompt (Elo Modeler):**
+> Activate Elo Modeler. Generate Elo-based power ratings and game predictions for these matchups: {game_list}. Sport: {sport}. Output: Elo rating for each team, predicted spread, and implied win probability per game.
+
+**Cross-reference (orchestrator):**
+> After both agents return, compare their spreads. If they disagree by more than 2 points on any game, flag as "model conflict" and downgrade confidence one tier for that game. Use the Market Maker's fair values as primary, with Elo as a validation signal.
+
+**Expected output:** Per-game fair-value spread, total, MLs, win probs, edge %, model agreement status.
 
 **Checkpoint:**
 > Fair values built | Edges found:
-> - [game]: market [X] -> fair value [Y] ([Z]% edge)
+> - [game]: market [X] -> fair value [Y] ([Z]% edge) | Elo agrees/conflicts
 > - [game]: [Z]% -- PASS
 > *Proceed with N actionable games? (yes / force [game] / drop [game])*
 
@@ -215,7 +259,7 @@ Each step in `workflows/daily-picks.md` follows this structure:
 **Dispatch mode:** foreground
 
 **Dispatch prompt:**
-> Activate Kelly Criterion Manager. Size bets for the following edges using fractional Kelly (1/4). Bankroll: {bankroll_balance}. For each pick: edge percentage is {edge_pct}, best available odds are {best_odds}. Apply drawdown protection rules. Enforce 3-unit max per bet and 10-unit portfolio cap. Output: game, side, units, dollar amount, and total portfolio exposure.
+> Activate Kelly Criterion Manager. Size bets using fractional Kelly (1/4). Bankroll: {bankroll_balance}. For each pick, here are the inputs — let Kelly compute the edge internally from these: win probability is {win_prob} (from Market Maker), best available American odds are {best_odds_american} (from Line Shopper). Apply drawdown protection rules. Enforce 3-unit max per bet and 10-unit portfolio cap. Output: game, side, computed edge %, Kelly fraction, units, dollar amount, and total portfolio exposure.
 
 **Expected output:** Sized picks with units, dollars, and total exposure.
 
@@ -230,7 +274,28 @@ Each step in `workflows/daily-picks.md` follows this structure:
 
 The orchestrator itself assembles the final betslip from all upstream outputs. No agent dispatch needed.
 
-**Action:** Combine outputs from all steps into a final betslip. For each pick: matchup, recommended side, best book + line, fair value, edge %, units, dollar stake, and a 2-3 sentence thesis drawing from the pregame research. For passed games, show why (edge below 3%, thin market, etc.). End with exposure summary and responsible gambling disclaimer.
+**Action:** Before assembling the betslip, check odds timestamps from Step 2 against game commence times. If any odds are > 90 minutes stale relative to game time, flag as "STALE" and exclude from the betslip. Then combine outputs from all steps into a final betslip. For each pick: matchup, recommended side, best book + line, fair value, edge %, model agreement (Market Maker vs Elo), units, dollar stake, and a 2-3 sentence thesis drawing from the pregame research. For passed games, show why (edge below 3%, thin market, model conflict, stale odds, etc.). End with exposure summary and responsible gambling disclaimer.
+
+---
+
+### Step 8 — Bet Recording (optional, user-initiated)
+
+**Agent:** State Manager
+**Depends on:** Step 7 (user approval of betslip)
+**Dispatch mode:** foreground
+
+After presenting the betslip, ask the user: *"Record these picks to your bankroll? (yes / no)"*
+
+If yes:
+
+**Dispatch prompt:**
+> Activate State Manager. Record the following bets to ~/.syndicate/bankroll.db. For each bet, insert into the bets table with: sport = {sport}, game = {matchup}, side = {side}, odds = {best_odds_american}, stake = {dollar_amount}, agent_used = "Sharp Orchestrator (pipeline: Odds Scraper -> Pregame Researcher -> Market Maker -> Elo Modeler -> Line Shopper -> Kelly Criterion)". Set status to "open". Do not modify bankroll_state until the bets settle.
+
+**Expected output:** Confirmation of recorded bets with bet IDs.
+
+**Checkpoint:**
+> Recorded N bets | Bet IDs: [list]
+> *Run `./scripts/bankroll-status.sh` to verify.*
 
 ---
 
@@ -281,7 +346,12 @@ The existing agent personas work as-is when dispatched with the right prompts.
 
 1. **Hybrid execution mode** — auto-chains agents but surfaces output at each step for user intervention
 2. **Workflow-as-Script pattern** — modeled after agency-agents workflow examples where each step has the exact activation prompt
-3. **Parallel dispatch** — Steps 2+3 run concurrently; Step 3 dispatches one agent per game
+3. **Parallel dispatch** — Steps 2+3 run concurrently; Step 3 dispatches one agent per game; Step 4 dispatches Market Maker + Elo Modeler concurrently
 4. **No Python code** — the entire pipeline runs through Claude Code agent dispatching, not subprocess execution
-5. **Placeholder substitution** — `{placeholders}` in dispatch prompts are replaced with actual upstream output at runtime
-6. **Scope limited to Daily Picks** — other workflows (arb scan, pregame research, DFS, morning sync) are out of scope and will be converted later using the same pattern
+5. **Placeholder substitution** — `{placeholders}` in dispatch prompts are replaced with actual upstream output at runtime (see Placeholder Convention section)
+6. **Game list pre-fetch** — orchestrator fetches game list between Steps 1 and 2/3 to resolve the parallel dependency without adding a full agent dispatch
+7. **Kelly computes its own edge** — dispatch prompt passes win_prob and odds, not pre-computed edge, to avoid formula inconsistencies between Market Maker and Kelly
+8. **Dual model validation** — Market Maker + Elo Modeler run independently; disagreement > 2 points flags model conflict and downgrades confidence
+9. **Stale odds gate** — Step 7 checks odds timestamps; > 90 minutes stale = excluded from betslip
+10. **Bet recording is opt-in** — Step 8 only fires if the user confirms, per CLAUDE.md convention that State Manager is the canonical DB interface
+11. **Scope limited to Daily Picks** — other workflows (arb scan, pregame research, DFS, morning sync) are out of scope and will be converted later using the same pattern
