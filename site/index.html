@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Syndicate</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5; padding: 24px; max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 24px; font-weight: 600; margin-bottom: 4px; }
+  h2 { font-size: 16px; font-weight: 600; color: var(--muted); margin-bottom: 16px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 32px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  .card-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .card-value { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .card-detail { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .neutral { color: var(--yellow); }
+  .pending-color { color: var(--accent); }
+  .void-color { color: var(--muted); }
+
+  .section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--border); color: var(--muted);
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover { background: rgba(88,166,255,0.04); }
+
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .badge-win { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge-loss { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge-push { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge-pending { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .badge-void { background: rgba(139,148,158,0.15); color: var(--muted); }
+
+  .chart-container { height: 200px; position: relative; margin-top: 12px; }
+  .chart-bar { position: absolute; bottom: 0; background: var(--accent); border-radius: 2px 2px 0 0; min-width: 4px; opacity: 0.8; }
+  .chart-bar:hover { opacity: 1; }
+  .chart-line { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--border); }
+  .chart-label { position: absolute; left: 0; font-size: 10px; color: var(--muted); }
+  .empty { text-align: center; padding: 40px; color: var(--muted); }
+  .refresh { color: var(--muted); font-size: 12px; cursor: pointer; float: right; }
+  .refresh:hover { color: var(--accent); }
+  .odds { font-variant-numeric: tabular-nums; }
+
+  @media (max-width: 640px) {
+    body { padding: 12px; }
+    .cards { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .card-value { font-size: 22px; }
+    table { font-size: 12px; }
+    th, td { padding: 8px 6px; }
+  }
+</style>
+</head>
+<body>
+  <div style="display:flex;justify-content:space-between;align-items:baseline">
+    <div>
+      <h1>The Syndicate</h1>
+      <div class="subtitle">Sports Betting Dashboard</div>
+    </div>
+    <span class="refresh" onclick="load()">Refresh</span>
+  </div>
+
+  <div id="bankroll-cards" class="cards"></div>
+
+  <div id="equity-section" class="section" style="display:none">
+    <h2>Equity Curve</h2>
+    <div id="equity-chart" class="chart-container"></div>
+  </div>
+
+  <div class="section">
+    <h2>Bet History</h2>
+    <div id="bets-table"></div>
+  </div>
+
+  <div id="perf-section" class="section" style="display:none">
+    <h2>Agent Performance</h2>
+    <div id="perf-table"></div>
+  </div>
+
+<script>
+function fmt(n, prefix) {
+  if (n == null) return '-';
+  const s = Math.abs(n).toFixed(2);
+  const sign = n >= 0 ? '+' : '-';
+  return (prefix || '') + (n >= 0 ? '' : '-') + (prefix ? s : sign + s);
+}
+
+function fmtDollars(n) {
+  if (n == null) return '-';
+  return (n >= 0 ? '+' : '-') + '$' + Math.abs(n).toFixed(2);
+}
+
+function fmtOdds(n) {
+  if (n == null) return '-';
+  return n > 0 ? '+' + n : '' + n;
+}
+
+function resultBadge(r) {
+  if (!r) return '';
+  const cls = { WIN: 'badge-win', LOSS: 'badge-loss', PUSH: 'badge-push', PENDING: 'badge-pending', VOID: 'badge-void' };
+  return `<span class="badge ${cls[r] || ''}">${r}</span>`;
+}
+
+function pnlClass(n) {
+  if (n == null || n === 0) return '';
+  return n > 0 ? 'positive' : 'negative';
+}
+
+function renderCards(data) {
+  const b = data.bankroll;
+  const s = data.summary;
+  document.getElementById('bankroll-cards').innerHTML = `
+    <div class="card">
+      <div class="card-label">Balance</div>
+      <div class="card-value">$${b.current_balance.toFixed(2)}</div>
+      <div class="card-detail">Started at $${b.starting_balance.toFixed(2)}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">P&L</div>
+      <div class="card-value ${pnlClass(b.pnl)}">${fmtDollars(b.pnl)}</div>
+      <div class="card-detail">ROI: ${s.roi_pct}%</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Record</div>
+      <div class="card-value">${s.wins}-${s.losses}-${s.pushes}</div>
+      <div class="card-detail">${s.pending} pending, ${s.voided} void</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Win Rate</div>
+      <div class="card-value">${s.settled > 0 ? s.win_rate + '%' : '-'}</div>
+      <div class="card-detail">${s.settled} settled of ${s.total_bets} total</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Drawdown</div>
+      <div class="card-value ${b.drawdown_pct > 10 ? 'negative' : ''}">${b.drawdown_pct}%</div>
+      <div class="card-detail">Risk: ${b.risk_tolerance}</div>
+    </div>
+  `;
+}
+
+function renderEquity(snapshots) {
+  if (snapshots.length < 2) return;
+  document.getElementById('equity-section').style.display = 'block';
+  const chart = document.getElementById('equity-chart');
+  const balances = snapshots.map(s => s.balance);
+  const max = Math.max(...balances);
+  const min = Math.min(...balances);
+  const range = max - min || 1;
+  const w = 100 / snapshots.length;
+
+  let html = '';
+  snapshots.forEach((s, i) => {
+    const h = ((s.balance - min) / range) * 160 + 20;
+    const left = (i / snapshots.length) * 100;
+    html += `<div class="chart-bar" style="left:${left}%;width:${Math.max(w - 0.5, 2)}%;height:${h}px" title="${s.date}: $${s.balance.toFixed(2)}"></div>`;
+  });
+  html += `<div class="chart-line" style="bottom:20px"><span class="chart-label" style="bottom:2px">$${min.toFixed(0)}</span></div>`;
+  html += `<div class="chart-line" style="bottom:180px"><span class="chart-label" style="bottom:2px">$${max.toFixed(0)}</span></div>`;
+  chart.innerHTML = html;
+}
+
+function renderBets(bets) {
+  if (!bets.length) {
+    document.getElementById('bets-table').innerHTML = '<div class="empty">No bets recorded yet.</div>';
+    return;
+  }
+  let html = `<table><thead><tr>
+    <th>#</th><th>Date</th><th>Game</th><th>Selection</th><th>Odds</th><th>Stake</th><th>Result</th><th>P&L</th><th>Notes</th>
+  </tr></thead><tbody>`;
+  bets.forEach(b => {
+    const date = b.placed_at ? b.placed_at.slice(0, 10) : '-';
+    const pnl = b.pnl != null ? `<span class="${pnlClass(b.pnl)}">${fmtDollars(b.pnl)}</span>` : '-';
+    const notes = b.notes ? `<span title="${b.notes}">${b.notes.slice(0, 30)}${b.notes.length > 30 ? '...' : ''}</span>` : '';
+    html += `<tr>
+      <td>${b.id}</td>
+      <td>${date}</td>
+      <td>${b.game}</td>
+      <td><strong>${b.selection}</strong></td>
+      <td class="odds">${fmtOdds(b.odds)}</td>
+      <td>$${b.stake.toFixed(2)}</td>
+      <td>${resultBadge(b.result)}</td>
+      <td>${pnl}</td>
+      <td style="color:var(--muted);font-size:12px">${notes}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  document.getElementById('bets-table').innerHTML = html;
+}
+
+function renderPerformance(perf) {
+  if (!perf.length) return;
+  document.getElementById('perf-section').style.display = 'block';
+  let html = `<table><thead><tr>
+    <th>Agent</th><th>Sport</th><th>Bets</th><th>Win Rate</th><th>ROI</th><th>Avg CLV</th><th>Last Used</th>
+  </tr></thead><tbody>`;
+  perf.forEach(p => {
+    html += `<tr>
+      <td>${p.agent_name}</td>
+      <td>${p.sport}</td>
+      <td>${p.total_bets}</td>
+      <td>${p.win_rate.toFixed(1)}%</td>
+      <td class="${pnlClass(p.roi_pct)}">${p.roi_pct > 0 ? '+' : ''}${p.roi_pct.toFixed(1)}%</td>
+      <td>${p.avg_clv != null ? p.avg_clv.toFixed(2) : '-'}</td>
+      <td>${p.last_used || '-'}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  document.getElementById('perf-table').innerHTML = html;
+}
+
+async function load() {
+  try {
+    const resp = await fetch('/api/data');
+    const data = await resp.json();
+    renderCards(data);
+    renderEquity(data.snapshots);
+    renderBets(data.bets);
+    renderPerformance(data.agent_performance);
+  } catch (e) {
+    document.getElementById('bankroll-cards').innerHTML =
+      '<div class="card" style="grid-column:1/-1"><div class="empty">Failed to load data. Is serve.py running?</div></div>';
+  }
+}
+
+load();
+</script>
+</body>
+</html>
