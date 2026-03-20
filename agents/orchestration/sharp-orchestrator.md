@@ -72,6 +72,26 @@ These rules are enforced regardless of which workflow is running:
 - **3-unit single bet cap.** No individual pick exceeds 3 units.
 - **20% drawdown halt.** If State Manager reports >= 20% drawdown, stop immediately. No new picks until < 15%.
 
+### Signal-Aware Adjustments (automated, from `signal_performance`)
+
+The orchestrator queries `signal_performance` before finalizing picks and applies these automated adjustments:
+
+- **Conflict gate escalation.** If `model_conflict=true` bucket has negative ROI over 15+ settled bets for this sport, raise the edge floor from 3% to 5% for conflicted picks. (Default: 3% edge floor per base rules.)
+- **Edge floor escalation.** If `model_edge_pct` bucket `3-4%` has negative avg CLV over 20+ settled bets, raise the global edge floor to 4% for this sport.
+- **Thin market validation.** If `books_pricing` bucket `1-3` has negative ROI over 10+ bets, confirm existing 50% sizing reduction. If positive ROI, relax to 75%.
+- **Kelly calibration.** If a `kelly_fraction` bucket underperforms the next-lower bucket (both with 15+ bets), reduce Kelly fraction by 25% for that tier.
+- **Human override tracking.** Picks forced in or dropped by the user are recorded with `human_override: true` in signals. The feedback loop tracks override ROI separately.
+- **Minimum sample guard.** No automated adjustment triggers for any signal bucket with < 10 settled bets. Flag as "insufficient data" in the betslip.
+
+**Conservative by design:** The system can tighten rules automatically. Loosening rules (lowering edge floors, increasing sizing) requires human approval.
+
+**Transparency:** Every automated adjustment is shown in the betslip output:
+
+    Pick 2: DROPPED — Utah State +7 (-105)
+      Edge: 3.6% | Fair: Utah State +5.5 | CONFLICT (2.5 pts)
+      [signal adjustment] model_conflict=true has -8.3% ROI over 15 bets
+        — require 5%+ edge, this pick had 3.6%
+
 ## Available Workflows
 
 | Workflow | File | Status |
